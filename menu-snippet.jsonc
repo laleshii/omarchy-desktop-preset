@@ -1,0 +1,7 @@
+  // Desktop Preset: save/load/clear window layouts (desktop_preset).
+  // Each action pops its own picker via omarchy-menu-select/-input and reports
+  // the result with a notification, since these run with no terminal attached.
+  "trigger.preset": {"icon":"","label":"Preset","aliases":["preset","presets"]},
+  "trigger.preset.load": {"icon":"","label":"Load","action":"desktop-preset-menu-load"},
+  "trigger.preset.save": {"icon":"","label":"Save","action":"desktop-preset-menu-save"},
+  "trigger.preset.clear": {"icon":"","label":"Clear desktop","action":"desktop-preset-menu-clear"},

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# desktop-preset-menu-load - "Load" action for the omarchy.menu Preset submenu
+set -uo pipefail
+
+names=$(desktop_preset list --names 2>/dev/null)
+if [[ -z $names ]]; then
+  omarchy notification send "No desktop presets" "Save one first: desktop_preset save <name>" -g "" -u normal
+  exit 0
+fi
+
+chosen=$(omarchy menu select "Load preset" $names) || exit 0   # cancelled
+[[ -n $chosen ]] || exit 0
+
+ws=$(hyprctl activeworkspace -j | jq -r '.id')
+out=$(desktop_preset load "$chosen" -w "$ws" 2>&1)
+rc=$?
+
+if (( rc == 0 )); then
+  omarchy notification send "Loaded '$chosen'" "onto workspace $ws" -g ""
+else
+  omarchy notification send "Failed to load '$chosen'" "$(tail -n1 <<< "$out")" -g "" -u critical
+fi

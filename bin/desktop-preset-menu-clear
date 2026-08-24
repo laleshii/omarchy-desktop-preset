@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# desktop-preset-menu-clear - "Clear" action for the omarchy.menu Preset submenu
+set -uo pipefail
+
+n=$(hyprctl activeworkspace -j | jq -r '.id')
+count=$(hyprctl clients -j | jq -r --argjson w "$n" '[.[]|select(.workspace.id==$w)]|length')
+if (( count == 0 )); then
+  omarchy notification send "Workspace $n is already empty" "" -g "󰭌"
+  exit 0
+fi
+
+confirm=$(omarchy menu select "Close $count window(s) on workspace $n?" Yes No) || exit 0
+[[ $confirm == Yes ]] || exit 0
+
+out=$(desktop_preset clear -w "$n" -y 2>&1)
+rc=$?
+
+if (( rc == 0 )); then
+  omarchy notification send "Cleared workspace $n" "" -g "󰭌"
+else
+  omarchy notification send "Failed to clear workspace $n" "$(tail -n1 <<< "$out")" -g "" -u critical
+fi

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# desktop-preset-menu-save - "Save" action for the omarchy.menu Preset submenu
+set -uo pipefail
+
+name=$(omarchy menu input "Preset name") || exit 0   # cancelled
+[[ -n $name ]] || exit 0
+
+if [[ ! $name =~ ^[A-Za-z0-9_-]+$ ]]; then
+  omarchy notification send "Invalid preset name" "Use letters, numbers, - and _ only" -g "" -u critical
+  exit 1
+fi
+
+extra_args=()
+if [[ -e ${XDG_CONFIG_HOME:-$HOME/.config}/desktop_preset/$name.preset ]]; then
+  confirm=$(omarchy menu select "'$name' already exists — overwrite?" Yes No) || exit 0
+  [[ $confirm == Yes ]] || exit 0
+  extra_args+=(--force)
+fi
+
+out=$(desktop_preset save "$name" "${extra_args[@]}" 2>&1)
+rc=$?
+
+if (( rc == 0 )); then
+  n=$(desktop_preset show "$name" 2>/dev/null | grep -cE '\|')
+  omarchy notification send "Saved '$name'" "$n app(s) from this workspace" -g "󰆓"
+else
+  omarchy notification send "Failed to save '$name'" "$(tail -n1 <<< "$out")" -g "" -u critical
+fi

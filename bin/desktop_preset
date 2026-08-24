@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# desktop_preset - save and load window layouts for a Hyprland workspace
+#
+# A preset is a "window-pattern | launch-command" line per app, plus
+# @anchor/@split directives recording the exact dwindle split tree (see
+# infer_tree) and @float lines for floating windows' exact position/size.
+# Loading replays that tree via focus+preselect, moving windows that
+# already exist rather than launching duplicates.
+
+set -uo pipefail
+
+DIR="${DESKTOP_PRESET_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/desktop_preset}"
+LAUNCH_TIMEOUT="${DESKTOP_PRESET_TIMEOUT:-20}"
+DRY=0; CLEAR=0; ASSUME_YES=0; WS=""; CLOSE_TERM=-1; FORCE=0; NAMES_ONLY=0   # -1 = follow preset directive
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[36m::\033[0m %s\n' "$*"; }
+act()  {
+  if (( DRY )); then printf '   would: %s\n' "$*"; return 0; fi
+  local out
+  if ! out=$("$@" 2>&1); then warn "command failed: $* -> $out"; return 1; fi
+  [[ $out == ok || -z $out ]] || warn "$* -> $out"
+}
+
+usage() {
+  cat <<'USAGE'
+desktop_preset - save and load window layouts for a Hyprland workspace
+
+usage:
+  desktop_preset list [--names]           show presets and their apps
+  desktop_preset show <name>              print a preset
+  desktop_preset load <name> [options]    load a preset
+  desktop_preset save <name> [-f]         draft a preset from this workspace
+  desktop_preset clear [options]          close windows on a workspace
+  desktop_preset edit <name>              open a preset in $EDITOR
+
+load/clear options:
+  -w, --workspace N        target workspace (default: current)
+  -y, --yes                don't ask before closing windows
+  -n, --dry-run            show what would happen, change nothing
+
+load-only options:
+  -c, --clear              close what's already on that workspace first
+  -t, --close-terminal     close the terminal you ran this from, once loaded
+      --no-close-terminal  never close it, even if the preset asks
+
+save-only options:
+  -f, --force               overwrite an existing preset of the same name
+
+presets live in ~/.config/desktop_preset/<name>.preset
+  <window-pattern> | <launch-command>    one app (also used as a launch dict
+                                          when a tree/float directive below
+                                          refers back to this pattern)
+  @close-terminal                        close the calling terminal after load
+  @anchor <pattern>                      first window placed, alone
+  @split <focus> <dir> <new>             split <focus>'s slot, <dir> (r/d),
+                                          placing <new> there (written by save,
+                                          one line per window after the anchor)
+  @float <pattern> <x> <y> <w> <h>       exact position/size for a floating
+                                          window (written by save)
+
+save reconstructs the actual dwindle split tree from each window's saved
+position and size and records it exactly as @anchor/@split — this is what
+loading replays, so the split shape comes back exact, not guessed. Falls
+back to plain reading order (no @anchor) when two windows share the same
+pattern (their identity is ambiguous) or with more than 10 windows.
+USAGE
+}
+
+# --- hyprland helpers -----------------------------------------------------
+# Dispatches use Hyprland's Lua syntax (hl.dsp.*). The legacy string form
+# ("movetoworkspacesilent 9,address:0x..") is rejected by this build.
+
+cur_ws() { hyprctl activeworkspace -j | jq -r '.id'; }
+
+# Windows on a workspace, in the order they visually sit: left to right,
+# then top to bottom. That reading order is what a preset round-trips.
+ws_addrs() {
+  hyprctl clients -j | jq -r --argjson w "$1" \
+    '[.[]|select(.workspace.id==$w)]|sort_by(.at[0], .at[1])|.[].address'
+}
+
+# Same matching rule omarchy-launch-or-focus uses: word-boundary, case
+# insensitive, against class or title.
+find_window() {
+  hyprctl clients -j | jq -r --arg p "$1" \
+    '.[]|select((.class|test("\\b"+$p+"\\b";"i")) or (.title|test("\\b"+$p+"\\b";"i")))|.address' \
+    | head -n1
+}
+
+describe() { hyprctl clients -j | jq -r --arg a "$1" '.[]|select(.address==$a)|"\(.class) — \(.title)"' | head -n1; }
+
+move_to_ws() { act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$2\", follow = false, window = \"address:$1\" })"; }
+ws_of()      { hyprctl clients -j | jq -r --arg a "$1" '.[]|select(.address==$a)|.workspace.id'; }
+
+# Moving a window to the workspace it already occupies is a no-op, so a window
+# that is already there would keep its old slot. Bouncing it through a hidden
+# special workspace forces it to be re-appended, which is what lets a preset
+# dictate the final left-to-right order.
+STAGE="special:desktop_preset_stage"
+
+# The final move deliberately lets focus follow. This workspace uses dwindle,
+# where a window is inserted by splitting whichever window holds focus; with
+# follow=false the split target is arbitrary and the layout comes out scrambled.
+# Letting focus land on each window means the next one splits it, so the file
+# order is reproduced.
+move_to_ws_follow() { act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$2\", window = \"address:$1\" })"; }
+
+place() {
+  local addr=$1 ws=$2
+  if (( DRY )) || [[ $(ws_of "$addr") == "$ws" ]]; then
+    move_to_ws "$addr" "$STAGE"
+  fi
+  move_to_ws_follow "$addr" "$ws"
+  (( DRY )) || sleep 0.15
+}
+close_addr() { act hyprctl dispatch "hl.dsp.window.close({ window = \"address:$1\" })"; }
+
+wait_for_window() {
+  local pat=$1 i
+  for ((i = 0; i < LAUNCH_TIMEOUT * 10; i++)); do
+    [[ -n $(find_window "$pat") ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_gone() {
+  local ws=$1 i
+  for ((i = 0; i < 40; i++)); do
+    [[ -z $(ws_addrs "$ws") ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# The window of the terminal this script was invoked from: walk our process
+# ancestry and find the client whose pid is one of our forebears.
+calling_terminal_addr() {
+  local -a anc=(); local p=$$ ppid i
+  for ((i = 0; i < 12; i++)); do
+    anc+=("$p")
+    ppid=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null) || break
+    [[ -z $ppid || $ppid -le 1 ]] && break
+    p=$ppid
+  done
+  local plist; plist=$(printf '%s\n' "${anc[@]}" | jq -s 'map(tonumber)')
+  hyprctl clients -j | jq -r --argjson pids "$plist" \
+    '.[]|select(.pid as $x | ($pids|index($x)) != null)|.address' | head -n1
+}
+
+preset_file() { printf '%s/%s.preset\n' "$DIR" "$1"; }
+
+# The actual dwindle split tree, reconstructed purely from each window's
+# saved position/size (see desktop-preset-layout for the algorithm and why
+# this is exact rather than heuristic). `rects` is a JSON array of
+# {id,x,y,w,h}, one per tiled window, id = the same pattern the preset's
+# launch line uses. Prints "ANCHOR <pattern>" then one "SPLIT <focus> <dir>
+# <new>" per remaining window, in build order. Prints nothing and returns
+# non-zero if the shape can't be inferred (duplicate pattern, too many
+# windows, or a genuinely non-guillotine arrangement, which dwindle itself
+# can never actually produce).
+infer_tree() {
+  local rects=$1 result
+  [[ $(jq 'length' <<< "$rects") -ge 1 ]] || return 1
+  [[ $(jq '[.[].id]|unique|length' <<< "$rects") == $(jq 'length' <<< "$rects") ]] || return 1
+  result=$(desktop-preset-layout infer <<< "$rects") || return 1
+  jq -r '"ANCHOR\t" + .anchor, (.steps[]|"SPLIT\t\(.focus)\t\(.dir)\t\(.new)")' <<< "$result"
+}
+
+# Close every window on a workspace, asking first unless told not to. Shared
+# by `clear` and `load --clear` so the two behave identically.
+close_workspace() {
+  local ws=$1
+  local -a doomed=(); local addr
+  while read -r addr; do [[ -n $addr ]] && doomed+=("$addr"); done < <(ws_addrs "$ws")
+  if (( ! ${#doomed[@]} )); then
+    printf '   workspace %s is already empty\n' "$ws"
+    return 0
+  fi
+  printf '   closing %s window(s) on workspace %s:\n' "${#doomed[@]}" "$ws"
+  for addr in "${doomed[@]}"; do printf '     - %s\n' "$(describe "$addr")"; done
+  if (( ! ASSUME_YES && ! DRY )); then
+    printf '   proceed? [y/N] '; local reply; read -r reply </dev/tty
+    [[ $reply == [yY]* ]] || die "aborted"
+  fi
+  for addr in "${doomed[@]}"; do close_addr "$addr"; done
+  (( DRY )) || wait_gone "$ws" || warn "some windows did not close (unsaved changes?)"
+}
+
+# --- subcommands ----------------------------------------------------------
+
+cmd_list() {
+  shopt -s nullglob
+  local f n found=0 pat cmd line
+  for f in "$DIR"/*.preset; do
+    found=1; n=$(basename "$f" .preset)
+    if (( NAMES_ONLY )); then printf '%s\n' "$n"; continue; fi
+    printf '\033[1m%s\033[0m\n' "$n"
+    while IFS= read -r line; do
+      [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+      if [[ $line =~ ^[[:space:]]*@ ]]; then
+        printf '    \033[2m%s\033[0m\n' "$(sed -E 's/^[[:space:]]*//' <<< "$line")"
+        continue
+      fi
+      pat=$(sed -E 's/\|.*//; s/[[:space:]]+$//' <<< "$line")
+      cmd=$(sed -E 's/^[^|]*\|[[:space:]]*//' <<< "$line")
+      printf '    %-28s \033[2m%s\033[0m\n' "$pat" "$cmd"
+    done < "$f"
+    printf '\n'
+  done
+  (( found || NAMES_ONLY )) || info "no presets yet — try: desktop_preset save <name>"
+}
+
+cmd_show() {
+  local f; f=$(preset_file "$1"); [[ -r $f ]] || die "no such preset: $1"
+  cat "$f"
+}
+
+cmd_edit() {
+  local f; f=$(preset_file "$1"); [[ -e $f ]] || die "no such preset: $1"
+  exec "${EDITOR:-nano}" "$f"
+}
+
+cmd_save() {
+  local name=$1 f ws addr cls host tui pat cmdline
+  f=$(preset_file "$name"); ws=$(cur_ws)
+  [[ -e $f && $FORCE -eq 0 ]] && die "preset already exists: $f (use --force to overwrite, or edit/delete it first)"
+
+  # One pass over every window on the workspace: derive its preset pattern
+  # and best-guess launch command (same class-based guessing as before),
+  # keyed by address so both the tiled tree and the floating list can look
+  # them up without re-deriving anything.
+  local -A pattern_of=() command_of=() floating_of=()
+  while read -r addr; do
+    [[ -n $addr ]] || continue
+    cls=$(hyprctl clients -j | jq -r --arg a "$addr" '.[]|select(.address==$a)|.class')
+    case $cls in
+      chrome-*__-Default)
+        host=${cls#chrome-}; host=${host%%__*}
+        pat=$host; cmdline="omarchy-launch-webapp https://$host/" ;;
+      org.omarchy.*)
+        tui=${cls#org.omarchy.}
+        pat=$tui; cmdline="omarchy-launch-tui $tui" ;;
+      "" ) continue ;;
+      *)
+        pat=$cls; cmdline="uwsm-app -- TODO($cls)" ;;
+    esac
+    pattern_of[$addr]=$pat
+    command_of[$addr]=$cmdline
+    floating_of[$addr]=$(hyprctl clients -j | jq -r --arg a "$addr" '.[]|select(.address==$a)|.floating')
+  done < <(hyprctl clients -j | jq -r --argjson w "$ws" '[.[]|select(.workspace.id==$w)]|.[].address')
+
+  local -a tree_lines=() float_lines=()
+  local tiled_count=0
+  for addr in "${!pattern_of[@]}"; do
+    [[ ${floating_of[$addr]} == true ]] || (( tiled_count++ ))
+  done
+
+  if (( tiled_count )); then
+    local rects_json="[]"
+    for addr in "${!pattern_of[@]}"; do
+      [[ ${floating_of[$addr]} == true ]] && continue
+      rects_json=$(hyprctl clients -j | jq -c --arg a "$addr" --arg p "${pattern_of[$addr]}" \
+        --argjson acc "$rects_json" \
+        '.[]|select(.address==$a)| $acc + [{id:$p, x:.at[0], y:.at[1], w:.size[0], h:.size[1]}]')
+    done
+    local tree; tree=$(infer_tree "$rects_json") || true
+    while IFS=$'\t' read -r kind a b c; do
+      case $kind in
+        ANCHOR) tree_lines+=("@anchor $a") ;;
+        SPLIT)  tree_lines+=("@split $a $b $c") ;;
+      esac
+    done <<< "$tree"
+  fi
+
+  for addr in "${!pattern_of[@]}"; do
+    [[ ${floating_of[$addr]} == true ]] || continue
+    read -r fx fy fw fh < <(hyprctl clients -j | jq -r --arg a "$addr" \
+      '.[]|select(.address==$a)|"\(.at[0]) \(.at[1]) \(.size[0]) \(.size[1])"')
+    float_lines+=("@float ${pattern_of[$addr]} $fx $fy $fw $fh")
+  done
+
+  { printf '# %s — drafted from workspace %s on %s\n' "$name" "$ws" "$(date +%F)"
+    printf '# format: <window-pattern> | <launch-command>\n'
+    printf '# review the commands below; anything marked TODO could not be guessed.\n\n'
+    # Reading order (left-to-right, top-to-bottom) purely for a human skimming
+    # the file, and as the fallback placement order when there's no tree.
+    while read -r addr; do
+      [[ -n ${pattern_of[$addr]+x} ]] || continue
+      printf '%-28s | %s\n' "${pattern_of[$addr]}" "${command_of[$addr]}"
+    done < <(ws_addrs "$ws")
+    if (( ${#tree_lines[@]} )); then
+      printf '\n'; printf '%s\n' "${tree_lines[@]}"
+    elif (( tiled_count > 1 )); then
+      warn "couldn't reconstruct an exact split tree — falling back to plain layout order (this preset will get the apps right, but not necessarily the exact split)"
+    fi
+    (( ${#float_lines[@]} )) && { printf '\n'; printf '%s\n' "${float_lines[@]}"; }
+  } > "$f"
+
+  info "drafted $f"
+  cmd_show "$name"
+}
+
+# Resolve a preset pattern to a live address: reuse an already-open window,
+# or launch its recorded command and wait for it to appear. Prints progress
+# to stderr (so it interleaves correctly under `foo | while read`) and the
+# resolved address to stdout; empty stdout means "give up on this one".
+resolve_or_launch() {
+  local p=$1 addr cmdline
+  addr=$(find_window "$p")
+  if [[ -n $addr ]]; then
+    printf '   found  %-26s %s\n' "$p" "($(describe "$addr"))" >&2
+    echo "$addr"; return 0
+  fi
+  cmdline=${command_of[$p]:-}
+  if [[ -z $cmdline ]]; then warn "no launch command recorded for: $p"; return 1; fi
+  if [[ $cmdline == *TODO\(* ]]; then warn "skipping unfinished entry: $p"; return 1; fi
+  printf '   launch %-26s %s\n' "$p" "$cmdline" >&2
+  if (( DRY )); then printf '   would: setsid bash -c %s\n' "$(printf '%q' "$cmdline")" >&2; return 1; fi
+  # bash -c re-parses $cmdline as shell syntax (quotes, etc); plain unquoted
+  # expansion (`setsid $cmdline`) only word-splits the already-substituted
+  # string and breaks on any command containing quoted arguments.
+  setsid bash -c "$cmdline" >/dev/null 2>&1 &
+  if wait_for_window "$p"; then find_window "$p"; return 0; fi
+  warn "timed out after ${LAUNCH_TIMEOUT}s waiting for: $p"
+  return 1
+}
+
+cmd_load() {
+  local name=$1 f ws line n=0 want_close=0 term=""
+  local -a placed=()
+  f=$(preset_file "$name"); [[ -r $f ]] || die "no such preset: $name"
+  ws=${WS:-$(cur_ws)}
+  [[ $ws =~ ^[0-9]+$ ]] || die "workspace must be a number: $ws"
+
+  grep -qE '^[[:space:]]*@close-terminal[[:space:]]*$' "$f" && want_close=1
+  (( CLOSE_TERM == 1 )) && want_close=1
+  (( CLOSE_TERM == 0 )) && want_close=0
+
+  # Launch dictionary (pattern -> command); resolve_or_launch reads this as
+  # a global. `order` is file order, used only by the no-tree fallback.
+  declare -gA command_of=()
+  local -a order=() splits=() floats=()
+  local -A is_floating=()
+  local anchor="" pat cmd
+  while IFS= read -r line; do
+    if [[ $line =~ ^@anchor[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+      anchor=${BASH_REMATCH[1]}
+    elif [[ $line =~ ^@split[[:space:]]+([^[:space:]]+)[[:space:]]+([lrud])[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+      splits+=("${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}"$'\t'"${BASH_REMATCH[3]}")
+    elif [[ $line =~ ^@float[[:space:]]+([^[:space:]]+)[[:space:]]+(-?[0-9]+)[[:space:]]+(-?[0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]*$ ]]; then
+      floats+=("${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}"$'\t'"${BASH_REMATCH[3]}"$'\t'"${BASH_REMATCH[4]}"$'\t'"${BASH_REMATCH[5]}")
+      is_floating[${BASH_REMATCH[1]}]=1
+    elif [[ $line =~ ^[[:space:]]*(#|@|$) ]]; then
+      continue
+    else
+      pat=$(sed -E 's/\|.*//; s/[[:space:]]+$//' <<< "$line")
+      cmd=$(sed -E 's/^[^|]*\|[[:space:]]*//' <<< "$line")
+      [[ -n $pat && -n $cmd ]] || { warn "skipping malformed line: $line"; continue; }
+      command_of[$pat]=$cmd
+      order+=("$pat")
+    fi
+  done < "$f"
+
+  info "loading '$name' onto workspace $ws"
+
+  (( CLEAR )) && close_workspace "$ws"
+
+  act hyprctl dispatch "hl.dsp.focus({ workspace = \"$ws\" })"
+
+  if [[ -n $anchor ]]; then
+    # Exact path: replay the saved split tree. Each step focuses the window
+    # whose slot is being divided, preselects which side the new window
+    # takes, then places it there — Hyprland does the rest. See infer_tree.
+    local addr faddr naddr dir fpat npat
+    addr=$(resolve_or_launch "$anchor") && {
+      act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$ws\", follow = false, window = \"address:$addr\" })"
+      placed+=("$addr"); (( n++ ))
+    }
+    for line in "${splits[@]+"${splits[@]}"}"; do
+      IFS=$'\t' read -r fpat dir npat <<< "$line"
+      faddr=$(find_window "$fpat")
+      if [[ -z $faddr ]]; then warn "lost track of '$fpat' — stopping tree replay early"; break; fi
+      act hyprctl dispatch "hl.dsp.focus({ window = \"address:$faddr\" })"
+      act hyprctl dispatch "hl.dsp.layout(\"preselect $dir\")"
+      naddr=$(resolve_or_launch "$npat") || continue
+      act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$ws\", window = \"address:$naddr\" })"
+      placed+=("$naddr"); (( n++ ))
+    done
+  else
+    # No tree recorded (see infer_tree/cmd_save): fall back to plain file
+    # order. A launch is awaited before the next entry starts, and every
+    # window is (re)moved onto the workspace so left-to-right order matches
+    # the file, though the exact split shape isn't guaranteed this way.
+    local addr
+    for pat in "${order[@]+"${order[@]}"}"; do
+      [[ -n ${is_floating[$pat]+x} ]] && continue
+      addr=$(resolve_or_launch "$pat") || continue
+      place "$addr" "$ws"; placed+=("$addr"); (( n++ ))
+    done
+  fi
+
+  for line in "${floats[@]+"${floats[@]}"}"; do
+    local fx fy fw fh addr
+    IFS=$'\t' read -r pat fx fy fw fh <<< "$line"
+    addr=$(resolve_or_launch "$pat") || continue
+    act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$ws\", follow = false, window = \"address:$addr\" })"
+    act hyprctl dispatch "hl.dsp.window.float({ action = \"enable\", window = \"address:$addr\" })"
+    act hyprctl dispatch "hl.dsp.window.resize({ x = $fw, y = $fh, window = \"address:$addr\" })"
+    act hyprctl dispatch "hl.dsp.window.move({ x = $fx, y = $fy, window = \"address:$addr\" })"
+    placed+=("$addr"); (( n++ ))
+  done
+
+  printf '\n'; info "$n entry(ies) placed on workspace $ws"
+
+  if (( want_close )); then
+    term=$(calling_terminal_addr)
+    if [[ -z $term ]]; then
+      warn "could not identify the calling terminal — leaving it open"
+    elif printf '%s\n' "${placed[@]+"${placed[@]}"}" | grep -qxF "$term"; then
+      warn "the calling terminal is one of the preset's own windows — leaving it open"
+    else
+      info "closing calling terminal ($(describe "$term"))"
+      close_addr "$term"
+    fi
+  fi
+}
+
+cmd_clear() {
+  local ws=${WS:-$(cur_ws)}
+  [[ $ws =~ ^[0-9]+$ ]] || die "workspace must be a number: $ws"
+  info "clearing workspace $ws"
+  close_workspace "$ws"
+}
+
+# --- main -----------------------------------------------------------------
+
+(( $# )) || { usage; exit 0; }
+sub=$1; shift
+# Options may appear before or after the preset name, so collect positionals
+# rather than stopping at the first one.
+declare -a POS=()
+while (( $# )); do
+  case $1 in
+    -w|--workspace)       WS=${2:?--workspace needs a number}; shift 2 ;;
+    -c|--clear)           CLEAR=1; shift ;;
+    -y|--yes)             ASSUME_YES=1; shift ;;
+    -t|--close-terminal)  CLOSE_TERM=1; shift ;;
+    --no-close-terminal)  CLOSE_TERM=0; shift ;;
+    -f|--force)           FORCE=1; shift ;;
+    --names)              NAMES_ONLY=1; shift ;;
+    -n|--dry-run)         DRY=1; shift ;;
+    -h|--help)            usage; exit 0 ;;
+    --)                   shift; while (( $# )); do POS+=("$1"); shift; done ;;
+    -*)                   die "unknown option: $1" ;;
+    *)                    POS+=("$1"); shift ;;
+  esac
+done
+set -- "${POS[@]+"${POS[@]}"}"
+
+mkdir -p "$DIR"
+case $sub in
+  list) cmd_list ;;
+  show) cmd_show "${1:?usage: desktop_preset show <name>}" ;;
+  edit) cmd_edit "${1:?usage: desktop_preset edit <name>}" ;;
+  save) cmd_save "${1:?usage: desktop_preset save <name>}" ;;
+  load) cmd_load "${1:?usage: desktop_preset load <name>}" ;;
+  clear) cmd_clear ;;
+  -h|--help|help) usage ;;
+  *) die "unknown subcommand: $sub (try --help)" ;;
+esac

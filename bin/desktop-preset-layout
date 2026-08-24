@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""desktop-preset-layout - infer a dwindle split tree from window rects, or
+replay one as a sequence of focus+preselect+place steps.
+
+Every tiled layout dwindle can produce is a "guillotine partition": the
+workspace rectangle, recursively cut in half (vertically or horizontally)
+until each piece is one window. `infer` reconstructs that cut tree purely
+from each window's saved (x, y, w, h) and reduces it to a build sequence:
+one anchor window, then one "focus this, preselect that direction, place
+this new window" step per remaining window - the same operations Hyprland
+itself performs when a layout is built by hand, so replaying them is exact
+and needs no aspect-ratio guessing.
+"""
+import sys
+import json
+import itertools
+
+TOL = 6  # px slack for gaps/borders when checking whether two edges align
+
+
+def fully_separated(a, b, axis):
+    """True if every rect in `a` lies entirely before every rect in `b`
+    along `axis` (0=x, 1=y), or vice versa - i.e. a straight guillotine cut
+    could separate the two groups."""
+    lo, hi = (0, 2) if axis == 0 else (1, 3)  # x0,x1 or y0,y1 within each rect tuple
+    a_max = max(r[hi] for r in a)
+    a_min = min(r[lo] for r in a)
+    b_max = max(r[hi] for r in b)
+    b_min = min(r[lo] for r in b)
+    if a_max <= b_min + TOL:
+        return True
+    if b_max <= a_min + TOL:
+        return False
+    return None  # not separated either way
+
+
+def find_split(items):
+    """items: list of (id, x0, y0, x1, y1). Returns (axis, before, after) as
+    two sub-lists of items, or None if this isn't a clean guillotine group."""
+    n = len(items)
+    idx = list(range(n))
+    for size in range(1, n):
+        for combo in itertools.combinations(idx[1:], size - 1):
+            a_idx = {0, *combo}
+            b_idx = set(idx) - a_idx
+            if not b_idx:
+                continue
+            a = [items[i] for i in a_idx]
+            b = [items[i] for i in b_idx]
+            for axis in (0, 1):
+                a_rects = [r[1:] for r in a]
+                b_rects = [r[1:] for r in b]
+                order = fully_separated(a_rects, b_rects, axis)
+                if order is True:
+                    return axis, a, b
+                if order is False:
+                    return axis, b, a
+    return None
+
+
+def build(items):
+    if len(items) == 1:
+        return ('leaf', items[0][0])
+    found = find_split(items)
+    if found is None:
+        raise ValueError(f"no clean guillotine cut among {[i[0] for i in items]}")
+    axis, before, after = found
+    return ('node', axis, build(before), build(after))
+
+
+def first_leaf(tree):
+    return tree[1] if tree[0] == 'leaf' else first_leaf(tree[2])
+
+
+def emit(tree):
+    steps = []
+
+    def walk(node):
+        if node[0] == 'leaf':
+            return
+        _, axis, c1, c2 = node
+        steps.append({
+            'focus': first_leaf(c1),
+            'dir': 'r' if axis == 0 else 'd',
+            'new': first_leaf(c2),
+        })
+        walk(c1)
+        walk(c2)
+
+    walk(tree)
+    return steps
+
+
+def cmd_infer():
+    rects = json.load(sys.stdin)
+    if not rects:
+        print(json.dumps({'anchor': None, 'steps': []}))
+        return
+    items = [(r['id'], r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h']) for r in rects]
+    if len(items) > 10:
+        print("error: too many windows for tree inference", file=sys.stderr)
+        sys.exit(1)
+    if len(items) == 1:
+        print(json.dumps({'anchor': items[0][0], 'steps': []}))
+        return
+    try:
+        tree = build(items)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({'anchor': first_leaf(tree), 'steps': emit(tree)}))
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 2 and sys.argv[1] == 'infer':
+        cmd_infer()
+    else:
+        print(f"usage: {sys.argv[0]} infer  (rects as JSON on stdin)", file=sys.stderr)
+        sys.exit(1)
