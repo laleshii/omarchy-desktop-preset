@@ -27,8 +27,9 @@ No terminal needed — everything below runs from **Menu → Trigger → Preset*
 
 | | |
 |---|---|
-| ![Trigger menu](docs/screenshots/5-menu-trigger.jpg) `omarchy menu` → Trigger, with Preset listed | ![Preset submenu](docs/screenshots/6-menu-preset.jpg) The Preset submenu: Load / Save / Clear desktop |
+| ![Trigger menu](docs/screenshots/5-menu-trigger.jpg) `omarchy menu` → Trigger, with Preset listed | ![Preset submenu](docs/screenshots/6-menu-preset.jpg) The Preset submenu: Load / Save / Clear desktop / Autostart |
 | ![Load picker](docs/screenshots/7-menu-load-picker.jpg) Load — picks from your saved presets | ![Save prompt](docs/screenshots/8-menu-save-input.jpg) Save — names the current workspace's layout |
+| ![Autostart submenu](docs/screenshots/9-menu-autostart.jpg) Autostart — Enable here / Disable here / List autostart | ![Autostart enable picker](docs/screenshots/10-menu-autostart-enable-picker.jpg) Enable here — picks which preset this workspace auto-loads at login |
 
 ## Why
 
@@ -52,8 +53,9 @@ git clone <this-repo> && cd omarchy-desktop-preset
 ```
 
 This copies the scripts to `~/.local/bin`, creates `~/.config/desktop_preset`,
-and adds a **Preset** entry under **Trigger** in your Omarchy menu (safe to
-re-run — it won't duplicate the menu entry if it's already there).
+adds a **Preset** entry under **Trigger** in your Omarchy menu, and wires up
+login autostart via `~/.config/hypr/autostart.lua` (safe to re-run — it won't
+duplicate the menu entry or the autostart line if they're already there).
 
 ### Dependencies
 
@@ -88,6 +90,31 @@ doing it. Run `desktop_preset --help` for the full flag list.
 From the desktop: open the Omarchy menu → **Trigger → Preset → Load / Save /
 Clear desktop**. Each pops its own picker (no terminal needed) and reports
 the result as a notification.
+
+## Auto-load at login
+
+Pin a preset to a workspace and it loads automatically the next time you log
+in — handy for a "chat" or "work" arrangement you always want in the same
+place, without running anything by hand.
+
+```
+desktop_preset autostart set chat -w 3   # workspace 3 loads 'chat' at login
+desktop_preset autostart list            # see what's configured
+desktop_preset autostart unset -w 3      # stop auto-loading on workspace 3
+```
+
+Or from the desktop: **Menu → Trigger → Preset → Autostart → Enable here /
+Disable here** (uses whichever workspace you're on) and **List autostart**.
+
+`./install.sh` wires the login side up for you, adding
+`o.launch_on_start("desktop-preset-autostart")` to
+`~/.config/hypr/autostart.lua` (safe to re-run, same as the menu entry). At
+login this runs `desktop_preset autostart run`, which loads every configured
+workspace — skipping any workspace that already has windows on it rather
+than closing them, so it won't clobber anything if you trigger it by hand
+mid-session. The mapping itself lives in
+`~/.config/desktop_preset/autostart.conf` (`<workspace>=<preset>`, one per
+line).
 
 ## How a preset is stored
 

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# desktop-preset-autostart - runs at Hyprland login (see install.sh, which
+# wires this into ~/.config/hypr/autostart.lua). Thin wrapper around
+# `desktop_preset autostart run` that reports failures via notification,
+# since this runs with no terminal attached.
+set -uo pipefail
+
+out=$(desktop_preset autostart run 2>&1)
+rc=$?
+
+if (( rc != 0 )); then
+  omarchy notification send "Desktop preset autostart failed" "$(tail -n1 <<< "$out")" -g "" -u critical
+fi

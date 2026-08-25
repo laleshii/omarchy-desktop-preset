@@ -5,3 +5,7 @@
   "trigger.preset.load": {"icon":"","label":"Load","action":"desktop-preset-menu-load"},
   "trigger.preset.save": {"icon":"","label":"Save","action":"desktop-preset-menu-save"},
   "trigger.preset.clear": {"icon":"","label":"Clear desktop","action":"desktop-preset-menu-clear"},
+  "trigger.preset.autostart": {"icon":"","label":"Autostart","aliases":["autostart"]},
+  "trigger.preset.autostart.enable": {"icon":"","label":"Enable here","action":"desktop-preset-menu-autostart-enable"},
+  "trigger.preset.autostart.disable": {"icon":"","label":"Disable here","action":"desktop-preset-menu-autostart-disable"},
+  "trigger.preset.autostart.list": {"icon":"","label":"List autostart","action":"desktop-preset-menu-autostart-list"},

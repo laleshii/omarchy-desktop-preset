@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# desktop-preset-menu-autostart-disable - "Disable on this desktop" action for
+# the omarchy.menu Preset -> Autostart submenu
+set -uo pipefail
+
+ws=$(hyprctl activeworkspace -j | jq -r '.id')
+current=$(desktop_preset autostart list --raw 2>/dev/null | awk -F= -v w="$ws" '$1==w{print $2}')
+
+if [[ -z $current ]]; then
+  omarchy notification send "Nothing to disable" "workspace $ws has no autostart preset" -g "󰭌"
+  exit 0
+fi
+
+out=$(desktop_preset autostart unset -w "$ws" 2>&1)
+rc=$?
+
+if (( rc == 0 )); then
+  omarchy notification send "Autostart disabled" "workspace $ws no longer loads '$current' at login" -g "󰭌"
+else
+  omarchy notification send "Failed to disable autostart" "$(tail -n1 <<< "$out")" -g "" -u critical
+fi

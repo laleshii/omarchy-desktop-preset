@@ -11,7 +11,7 @@ set -uo pipefail
 
 DIR="${DESKTOP_PRESET_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/desktop_preset}"
 LAUNCH_TIMEOUT="${DESKTOP_PRESET_TIMEOUT:-20}"
-DRY=0; CLEAR=0; ASSUME_YES=0; WS=""; CLOSE_TERM=-1; FORCE=0; NAMES_ONLY=0   # -1 = follow preset directive
+DRY=0; CLEAR=0; ASSUME_YES=0; WS=""; CLOSE_TERM=-1; FORCE=0; NAMES_ONLY=0; RAW=0   # -1 = follow preset directive
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
@@ -34,6 +34,10 @@ usage:
   desktop_preset save <name> [-f]         draft a preset from this workspace
   desktop_preset clear [options]          close windows on a workspace
   desktop_preset edit <name>              open a preset in $EDITOR
+  desktop_preset autostart list [--raw]   show which workspace loads what at login
+  desktop_preset autostart set <name> -w N    auto-load <name> on workspace N at login
+  desktop_preset autostart unset -w N     stop auto-loading on workspace N
+  desktop_preset autostart run            run all configured autostarts (see below)
 
 load/clear options:
   -w, --workspace N        target workspace (default: current)
@@ -47,6 +51,14 @@ load-only options:
 
 save-only options:
   -f, --force               overwrite an existing preset of the same name
+
+autostart:
+  a mapping of workspace -> preset name, stored at
+  ~/.config/desktop_preset/autostart.conf. `run` loads each configured
+  preset onto its workspace, skipping any workspace that already has
+  windows on it (so it's safe to invoke by hand, and idempotent if run
+  more than once). Wire it up with `./install.sh` or the Omarchy menu
+  (Trigger -> Preset -> Autostart) rather than calling `run` directly.
 
 presets live in ~/.config/desktop_preset/<name>.preset
   <window-pattern> | <launch-command>    one app (also used as a launch dict
@@ -151,6 +163,7 @@ calling_terminal_addr() {
 }
 
 preset_file() { printf '%s/%s.preset\n' "$DIR" "$1"; }
+autostart_file() { printf '%s/autostart.conf\n' "$DIR"; }
 
 # The actual dwindle split tree, reconstructed purely from each window's
 # saved position/size (see desktop-preset-layout for the algorithm and why
@@ -435,6 +448,69 @@ cmd_clear() {
   close_workspace "$ws"
 }
 
+# --- autostart --------------------------------------------------------------
+# ~/.config/desktop_preset/autostart.conf holds one "<workspace>=<preset>"
+# line per configured workspace. `run` (invoked from ~/.config/hypr/autostart.lua
+# via desktop-preset-autostart, see install.sh) replays them at login.
+
+cmd_autostart_list() {
+  local f; f=$(autostart_file)
+  if (( RAW )); then
+    [[ -s $f ]] && cat "$f"
+    return 0
+  fi
+  [[ -s $f ]] || { info "no autostart entries yet — try: desktop_preset autostart set <name> -w <N>"; return 0; }
+  while IFS='=' read -r ws name; do
+    [[ -n $ws && -n $name ]] || continue
+    printf '  workspace %-3s -> %s\n' "$ws" "$name"
+  done < "$f"
+}
+
+cmd_autostart_set() {
+  local name=$1 ws f tmp
+  ws=${WS:-$(cur_ws)}
+  [[ $ws =~ ^[0-9]+$ ]] || die "workspace must be a number: $ws"
+  [[ -e $(preset_file "$name") ]] || die "no such preset: $name"
+  f=$(autostart_file); tmp=$(mktemp)
+  [[ -e $f ]] && grep -v -E "^${ws}=" "$f" > "$tmp"
+  printf '%s=%s\n' "$ws" "$name" >> "$tmp"
+  sort -t= -k1,1n -o "$tmp" "$tmp"
+  mv "$tmp" "$f"
+  info "workspace $ws will auto-load '$name' at login"
+}
+
+cmd_autostart_unset() {
+  local ws f tmp
+  ws=${WS:-$(cur_ws)}
+  [[ $ws =~ ^[0-9]+$ ]] || die "workspace must be a number: $ws"
+  f=$(autostart_file)
+  [[ -e $f ]] || { info "no autostart entry for workspace $ws"; return 0; }
+  tmp=$(mktemp)
+  grep -v -E "^${ws}=" "$f" > "$tmp"
+  mv "$tmp" "$f"
+  info "workspace $ws will no longer auto-load at login"
+}
+
+# Called with no terminal attached (from ~/.config/hypr/autostart.lua at
+# Hyprland start). Skips any workspace that already has windows on it,
+# rather than closing them — a workspace should only be non-empty here if
+# this got invoked by hand after login, and clobbering someone's in-progress
+# work would be the wrong default.
+cmd_autostart_run() {
+  local f ws name
+  f=$(autostart_file)
+  [[ -s $f ]] || { info "no autostart entries configured"; return 0; }
+  while IFS='=' read -r ws name; do
+    [[ -n $ws && -n $name ]] || continue
+    if [[ -n $(ws_addrs "$ws") ]]; then
+      info "workspace $ws already has windows — skipping autostart of '$name'"
+      continue
+    fi
+    info "autostart: loading '$name' onto workspace $ws"
+    WS=$ws cmd_load "$name"
+  done < "$f"
+}
+
 # --- main -----------------------------------------------------------------
 
 (( $# )) || { usage; exit 0; }
@@ -451,6 +527,7 @@ while (( $# )); do
     --no-close-terminal)  CLOSE_TERM=0; shift ;;
     -f|--force)           FORCE=1; shift ;;
     --names)              NAMES_ONLY=1; shift ;;
+    --raw)                RAW=1; shift ;;
     -n|--dry-run)         DRY=1; shift ;;
     -h|--help)            usage; exit 0 ;;
     --)                   shift; while (( $# )); do POS+=("$1"); shift; done ;;
@@ -468,6 +545,16 @@ case $sub in
   save) cmd_save "${1:?usage: desktop_preset save <name>}" ;;
   load) cmd_load "${1:?usage: desktop_preset load <name>}" ;;
   clear) cmd_clear ;;
+  autostart)
+    sub2=${1:?usage: desktop_preset autostart <list|set|unset|run>}; shift
+    case $sub2 in
+      list)   cmd_autostart_list ;;
+      set)    cmd_autostart_set "${1:?usage: desktop_preset autostart set <name>}" ;;
+      unset)  cmd_autostart_unset ;;
+      run)    cmd_autostart_run ;;
+      *)      die "unknown autostart subcommand: $sub2 (try list|set|unset|run)" ;;
+    esac
+    ;;
   -h|--help|help) usage ;;
   *) die "unknown subcommand: $sub (try --help)" ;;
 esac

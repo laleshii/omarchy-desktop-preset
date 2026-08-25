@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# desktop-preset-menu-autostart-list - "List autostart" action for the
+# omarchy.menu Preset -> Autostart submenu
+set -uo pipefail
+
+body=$(desktop_preset autostart list --raw 2>/dev/null | sed -E 's/^([0-9]+)=(.*)$/workspace \1 -> \2/')
+
+if [[ -z $body ]]; then
+  omarchy notification send "No autostart presets configured" "" -g "󰭌"
+else
+  omarchy notification send "Autostart at login" "$body" -g ""
+fi
