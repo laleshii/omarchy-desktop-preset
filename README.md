@@ -57,6 +57,16 @@ adds a **Preset** entry under **Trigger** in your Omarchy menu, and wires up
 login autostart via `~/.config/hypr/autostart.lua` (safe to re-run — it won't
 duplicate the menu entry or the autostart line if they're already there).
 
+To remove it:
+
+```
+./uninstall.sh           # removes scripts, menu entries, and autostart wiring
+./uninstall.sh --purge   # also deletes ~/.config/desktop_preset (your presets)
+```
+
+Your saved presets are left in place by default so a reinstall doesn't lose
+them.
+
 ### Dependencies
 
 - **Omarchy 4.0+** on **Hyprland 0.56+**. Built and tested against Omarchy
