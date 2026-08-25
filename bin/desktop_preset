@@ -162,6 +162,32 @@ calling_terminal_addr() {
     '.[]|select(.pid as $x | ($pids|index($x)) != null)|.address' | head -n1
 }
 
+# The exact command a running process was launched with, read straight from
+# the kernel — strictly more accurate than a .desktop file when it's
+# available, since it captures the real argv (a specific file, a profile
+# flag, ...) and, via cwd, a terminal's actual working directory, neither of
+# which any static file can tell you. Tried before guess_launch_command.
+proc_launch_command() {
+  local pid=$1 cwd cmd
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  local -a argv=()
+  while IFS= read -r -d '' arg; do argv+=("$arg"); done < "/proc/$pid/cmdline"
+  (( ${#argv[@]} > 0 )) || return 1
+  # Some launchers (observed: Slack's wrapper) hand the kernel a single argv
+  # element that is itself "binary --flag value" as one string with embedded
+  # spaces, rather than separate argv entries. Re-quoted, that comes out as
+  # one word for the shell to exec verbatim — which isn't a real path — so
+  # bail rather than hand load a command that can never succeed.
+  [[ -x ${argv[0]} ]] || return 1
+  cmd=$(printf '%q ' "${argv[@]}"); cmd=${cmd% }
+  cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+  if [[ -n $cwd && $cwd != "$HOME" ]]; then
+    printf 'cd %q && uwsm-app -- %s\n' "$cwd" "$cmd"
+  else
+    printf 'uwsm-app -- %s\n' "$cmd"
+  fi
+}
+
 # The Exec= line from a .desktop file's [Desktop Entry] section (not from an
 # Actions= sub-section further down, e.g. a "Quit" action's own Exec=).
 desktop_exec_line() {
@@ -310,7 +336,7 @@ cmd_edit() {
 }
 
 cmd_save() {
-  local name=$1 f ws addr cls host tui pat cmdline
+  local name=$1 f ws addr cls pid host tui pat cmdline
   f=$(preset_file "$name"); ws=$(cur_ws)
   [[ -e $f && $FORCE -eq 0 ]] && die "preset already exists: $f (use --force to overwrite, or edit/delete it first)"
 
@@ -332,7 +358,9 @@ cmd_save() {
       "" ) continue ;;
       *)
         pat=$cls
-        cmdline=$(guess_launch_command "$cls") || cmdline="uwsm-app -- TODO($cls)" ;;
+        pid=$(hyprctl clients -j | jq -r --arg a "$addr" '.[]|select(.address==$a)|.pid')
+        cmdline=$(proc_launch_command "$pid") || cmdline=$(guess_launch_command "$cls") \
+          || cmdline="uwsm-app -- TODO($cls)" ;;
     esac
     pattern_of[$addr]=$pat
     command_of[$addr]=$cmdline

@@ -160,11 +160,19 @@ windows on the workspace share the same pattern — their identity is
 ambiguous, so there's nothing reliable to build a tree from — or with more
 than 10 windows.
 
-`save` guesses each app's launch command from its `.desktop` file (matched
-by filename, then by `StartupWMClass`), the same source a real launcher
-would use — so this works for ordinary native apps, not just Chrome webapps
-and Omarchy TUI wrappers. If nothing matches, the command is left as
-`TODO(<class>)`, and `load` refuses to run it — fill it in by hand (`desktop_preset edit <name>`)
+For an app that isn't a Chrome webapp or an Omarchy TUI wrapper, `save`
+tries two ways to guess its launch command, in order:
+
+1. The window's actual process, via `/proc/<pid>/cmdline` — the exact argv
+   it was launched with (flags, files, profiles included), plus its working
+   directory if that differs from `$HOME`. More accurate than any static
+   file when it's usable, since it reflects how *this* window was actually
+   started rather than a generic default.
+2. Its `.desktop` file (matched by filename, then by `StartupWMClass`), the
+   same source a real launcher would use.
+
+If neither works, the command is left as `TODO(<class>)`, and `load` refuses
+to run it — fill it in by hand (`desktop_preset edit <name>`)
 before loading that preset cold.
 
 ## Limitations
