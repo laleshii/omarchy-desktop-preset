@@ -162,6 +162,79 @@ calling_terminal_addr() {
     '.[]|select(.pid as $x | ($pids|index($x)) != null)|.address' | head -n1
 }
 
+# The Exec= line from a .desktop file's [Desktop Entry] section (not from an
+# Actions= sub-section further down, e.g. a "Quit" action's own Exec=).
+desktop_exec_line() {
+  sed -n '/^\[Desktop Entry\]/,/^\[/{/^Exec=/p}' "$1" | head -n1
+}
+
+# Best-effort launch command for a window class that isn't a chrome webapp or
+# an Omarchy TUI wrapper: find its .desktop file and lift the Exec= line, the
+# same source a real launcher would use. Tried in order:
+#   1. filename stem == class, case-insensitive — covers reverse-DNS classes
+#      (e.g. org.telegram.desktop.desktop for class "org.telegram.desktop"),
+#      which is often more reliable than the next check.
+#   2. StartupWMClass == class, case-insensitive — desktop files frequently
+#      disagree with the class Hyprland actually reports (e.g. Slack ships
+#      StartupWMClass=Slack for class "slack"), so this is a fallback, not
+#      the first guess.
+# Prints "uwsm-app -- <command>" and returns 0, or returns 1 if nothing
+# matched (caller falls back to a TODO placeholder).
+guess_launch_command() {
+  local cls=$1 cls_lc=${1,,} dir f stem wmclass exec_line=""
+  local -a dirs=("${XDG_DATA_HOME:-$HOME/.local/share}/applications" /usr/share/applications)
+
+  for dir in "${dirs[@]}"; do
+    [[ -d $dir ]] || continue
+    for f in "$dir"/*.desktop; do
+      [[ -e $f ]] || continue
+      stem=${f##*/}; stem=${stem%.desktop}
+      if [[ ${stem,,} == "$cls_lc" ]]; then
+        exec_line=$(desktop_exec_line "$f")
+        [[ -n $exec_line ]] && break 2
+      fi
+    done
+  done
+
+  if [[ -z $exec_line ]]; then
+    for dir in "${dirs[@]}"; do
+      [[ -d $dir ]] || continue
+      for f in "$dir"/*.desktop; do
+        [[ -e $f ]] || continue
+        wmclass=$(sed -n 's/^StartupWMClass=//p' "$f" | head -n1)
+        if [[ -n $wmclass && ${wmclass,,} == "$cls_lc" ]]; then
+          exec_line=$(desktop_exec_line "$f")
+          [[ -n $exec_line ]] && break 2
+        fi
+      done
+    done
+  fi
+
+  [[ -n $exec_line ]] || return 1
+
+  # Drop field codes (%f/%F/%u/%U/%i/%c/%k/...) — they're always their own
+  # standalone argument per the desktop-entry spec — and, since we're
+  # launching cold with nothing to hand it, the bare flag that fed it too
+  # (e.g. "-s %U" or "-- %U"), or launching would leave that flag dangling
+  # with no value.
+  local raw=${exec_line#Exec=}
+  local -a tokens=($raw) cmd_tokens=()
+  local tok prev
+  for tok in "${tokens[@]}"; do
+    if [[ $tok =~ ^%[a-zA-Z]$ ]]; then
+      if (( ${#cmd_tokens[@]} > 0 )); then
+        prev=${cmd_tokens[-1]}
+        [[ $prev == -* && $prev != *=* ]] && unset 'cmd_tokens[-1]'
+      fi
+      continue
+    fi
+    cmd_tokens+=("$tok")
+  done
+  local cmd="${cmd_tokens[*]}"
+  [[ -n $cmd ]] || return 1
+  printf 'uwsm-app -- %s\n' "$cmd"
+}
+
 preset_file() { printf '%s/%s.preset\n' "$DIR" "$1"; }
 autostart_file() { printf '%s/autostart.conf\n' "$DIR"; }
 
@@ -258,7 +331,8 @@ cmd_save() {
         pat=$tui; cmdline="omarchy-launch-tui $tui" ;;
       "" ) continue ;;
       *)
-        pat=$cls; cmdline="uwsm-app -- TODO($cls)" ;;
+        pat=$cls
+        cmdline=$(guess_launch_command "$cls") || cmdline="uwsm-app -- TODO($cls)" ;;
     esac
     pattern_of[$addr]=$pat
     command_of[$addr]=$cmdline
@@ -427,6 +501,15 @@ cmd_load() {
   done
 
   printf '\n'; info "$n entry(ies) placed on workspace $ws"
+
+  # A preset that resolved nothing (e.g. every entry hit an unresolved TODO,
+  # or every launch timed out) shouldn't report success — the caller (the
+  # menu wrapper especially) relies on the exit code to know whether to show
+  # a success or a failure notification.
+  if (( n == 0 )); then
+    warn "nothing could be placed — check the preset for TODO entries (desktop_preset show $name)"
+    return 1
+  fi
 
   if (( want_close )); then
     term=$(calling_terminal_addr)

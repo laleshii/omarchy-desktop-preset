@@ -160,6 +160,13 @@ windows on the workspace share the same pattern — their identity is
 ambiguous, so there's nothing reliable to build a tree from — or with more
 than 10 windows.
 
+`save` guesses each app's launch command from its `.desktop` file (matched
+by filename, then by `StartupWMClass`), the same source a real launcher
+would use — so this works for ordinary native apps, not just Chrome webapps
+and Omarchy TUI wrappers. If nothing matches, the command is left as
+`TODO(<class>)`, and `load` refuses to run it — fill it in by hand (`desktop_preset edit <name>`)
+before loading that preset cold.
+
 ## Limitations
 
 - **`dwindle` layout only.** Hyprland's `master` layout and the
