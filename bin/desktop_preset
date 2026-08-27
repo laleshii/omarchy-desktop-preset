@@ -126,11 +126,23 @@ STAGE="special:desktop_preset_stage"
 # order is reproduced.
 move_to_ws_follow() { act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$2\", window = \"address:$1\" })"; }
 
-place() {
+# Bounce addr through the hidden stage workspace first if it's already on
+# $ws (see STAGE above) — otherwise the move a caller is about to make is a
+# no-op and the window keeps whatever slot/size it already had there,
+# instead of being correctly re-inserted (and, for a tiled window, resized)
+# per the preset's tree. Shared by place() and the exact-tree replay in
+# cmd_load, which each still do their own real move afterward (with
+# different follow= semantics), so this only handles the bounce.
+stage_bounce_if_needed() {
   local addr=$1 ws=$2
   if (( DRY )) || [[ $(ws_of "$addr") == "$ws" ]]; then
     move_to_ws "$addr" "$STAGE"
   fi
+}
+
+place() {
+  local addr=$1 ws=$2
+  stage_bounce_if_needed "$addr" "$ws"
   move_to_ws_follow "$addr" "$ws"
   (( DRY )) || sleep 0.15
 }
@@ -529,7 +541,9 @@ cmd_load() {
     # takes, then places it there — Hyprland does the rest. See infer_tree.
     local addr faddr naddr dir fpat npat
     addr=$(resolve_or_launch "$anchor") && {
+      stage_bounce_if_needed "$addr" "$ws"
       act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$ws\", follow = false, window = \"address:$addr\" })"
+      (( DRY )) || sleep 0.15
       placed+=("$addr"); (( n++ ))
     }
     for line in "${splits[@]+"${splits[@]}"}"; do
@@ -539,7 +553,9 @@ cmd_load() {
       act hyprctl dispatch "hl.dsp.focus({ window = \"address:$faddr\" })"
       act hyprctl dispatch "hl.dsp.layout(\"preselect $dir\")"
       naddr=$(resolve_or_launch "$npat") || continue
+      stage_bounce_if_needed "$naddr" "$ws"
       act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$ws\", window = \"address:$naddr\" })"
+      (( DRY )) || sleep 0.15
       placed+=("$naddr"); (( n++ ))
       if [[ -n ${size_of[$fpat]+x} ]]; then
         local sw sh; read -r sw sh <<< "${size_of[$fpat]}"
