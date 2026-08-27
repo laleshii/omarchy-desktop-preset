@@ -149,6 +149,11 @@ spotify_player                | omarchy-launch-tui spotify_player
   placing `<new>` there. One line per window after the anchor, in build
   order. This is the literal split tree, written by `save` — see
   `bin/desktop-preset-layout` for the reconstruction algorithm.
+- `@size <pattern> <w> <h>` — `<pattern>`'s exact saved size right after the
+  split above it. `load` resizes it back along that split's axis only (width
+  for a left/right split, height for up/down), and Hyprland grows or shrinks
+  the new sibling to fill what's left — this is what turns dwindle's default
+  50/50 into the saved ratio, not just the saved shape.
 - `@float <pattern> <x> <y> <w> <h>` — exact position/size for a floating
   window.
 - `@close-terminal` — if present, `load` closes the terminal it was run

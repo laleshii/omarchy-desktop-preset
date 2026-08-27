@@ -3,9 +3,10 @@
 #
 # A preset is a "window-pattern | launch-command" line per app, plus
 # @anchor/@split directives recording the exact dwindle split tree (see
-# infer_tree) and @float lines for floating windows' exact position/size.
-# Loading replays that tree via focus+preselect, moving windows that
-# already exist rather than launching duplicates.
+# infer_tree), @size directives recording each split's exact ratio, and
+# @float lines for floating windows' exact position/size. Loading replays
+# the tree via focus+preselect+resize, moving windows that already exist
+# rather than launching duplicates.
 
 set -uo pipefail
 
@@ -69,14 +70,20 @@ presets live in ~/.config/desktop_preset/<name>.preset
   @split <focus> <dir> <new>             split <focus>'s slot, <dir> (r/d),
                                           placing <new> there (written by save,
                                           one line per window after the anchor)
+  @size <pattern> <w> <h>                <pattern>'s exact size right after
+                                          the split above it; load resizes it
+                                          along that split's axis only, so
+                                          the sibling fills in the saved
+                                          ratio instead of dwindle's 50/50
   @float <pattern> <x> <y> <w> <h>       exact position/size for a floating
                                           window (written by save)
 
 save reconstructs the actual dwindle split tree from each window's saved
-position and size and records it exactly as @anchor/@split — this is what
-loading replays, so the split shape comes back exact, not guessed. Falls
-back to plain reading order (no @anchor) when two windows share the same
-pattern (their identity is ambiguous) or with more than 10 windows.
+position and size and records it exactly as @anchor/@split/@size — this is
+what loading replays, so both the split shape and ratio come back exact, not
+guessed. Falls back to plain reading order (no @anchor) when two windows
+share the same pattern (their identity is ambiguous) or with more than 10
+windows.
 USAGE
 }
 
@@ -128,6 +135,24 @@ place() {
   (( DRY )) || sleep 0.15
 }
 close_addr() { act hyprctl dispatch "hl.dsp.window.close({ window = \"address:$1\" })"; }
+
+# Nudge a freshly-split tiled window to its saved size along the split axis
+# only (r/l -> width, d/u -> height); the perpendicular axis is left at its
+# current live value, since dwindle already sizes it to fill whatever's left
+# from the ancestor splits. An absolute resize on one side of a dwindle split
+# shrinks/grows its sibling to match, which is what turns the tree's default
+# 50/50 shape into the exact saved ratio (see infer_tree).
+apply_saved_size() {
+  local addr=$1 dir=$2 w=$3 h=$4 cur cur_w cur_h
+  cur=$(hyprctl clients -j | jq -r --arg a "$addr" '.[]|select(.address==$a)|"\(.size[0]) \(.size[1])"')
+  read -r cur_w cur_h <<< "$cur"
+  [[ -n $cur_w && -n $cur_h ]] || return 1
+  case $dir in
+    r | l) act hyprctl dispatch "hl.dsp.window.resize({ x = $w, y = $cur_h, window = \"address:$addr\" })" ;;
+    d | u) act hyprctl dispatch "hl.dsp.window.resize({ x = $cur_w, y = $h, window = \"address:$addr\" })" ;;
+  esac
+  (( DRY )) || sleep 0.1
+}
 
 wait_for_window() {
   local pat=$1 i
@@ -382,10 +407,21 @@ cmd_save() {
         '.[]|select(.address==$a)| $acc + [{id:$p, x:.at[0], y:.at[1], w:.size[0], h:.size[1]}]')
     done
     local tree; tree=$(infer_tree "$rects_json") || true
+    local sw sh
     while IFS=$'\t' read -r kind a b c; do
       case $kind in
         ANCHOR) tree_lines+=("@anchor $a") ;;
-        SPLIT)  tree_lines+=("@split $a $b $c") ;;
+        SPLIT)
+          tree_lines+=("@split $a $b $c")
+          # The focus window's own final size, so load can resize it back to
+          # that (along the split axis only) right after this split creates
+          # its sibling — Hyprland grows/shrinks the sibling to fill what's
+          # left, turning dwindle's default 50/50 into the saved ratio.
+          # (Resizing the *new* window instead of the focus one was tried
+          # first and produced the ratio on the wrong side of the split.)
+          read -r sw sh < <(jq -r --arg id "$a" '.[]|select(.id==$id)|"\(.w) \(.h)"' <<< "$rects_json")
+          [[ -n $sw && -n $sh ]] && tree_lines+=("@size $a $sw $sh")
+          ;;
       esac
     done <<< "$tree"
   fi
@@ -458,13 +494,15 @@ cmd_load() {
   # a global. `order` is file order, used only by the no-tree fallback.
   declare -gA command_of=()
   local -a order=() splits=() floats=()
-  local -A is_floating=()
+  local -A is_floating=() size_of=()
   local anchor="" pat cmd
   while IFS= read -r line; do
     if [[ $line =~ ^@anchor[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
       anchor=${BASH_REMATCH[1]}
     elif [[ $line =~ ^@split[[:space:]]+([^[:space:]]+)[[:space:]]+([lrud])[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
       splits+=("${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}"$'\t'"${BASH_REMATCH[3]}")
+    elif [[ $line =~ ^@size[[:space:]]+([^[:space:]]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]*$ ]]; then
+      size_of[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
     elif [[ $line =~ ^@float[[:space:]]+([^[:space:]]+)[[:space:]]+(-?[0-9]+)[[:space:]]+(-?[0-9]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)[[:space:]]*$ ]]; then
       floats+=("${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}"$'\t'"${BASH_REMATCH[3]}"$'\t'"${BASH_REMATCH[4]}"$'\t'"${BASH_REMATCH[5]}")
       is_floating[${BASH_REMATCH[1]}]=1
@@ -503,6 +541,10 @@ cmd_load() {
       naddr=$(resolve_or_launch "$npat") || continue
       act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$ws\", window = \"address:$naddr\" })"
       placed+=("$naddr"); (( n++ ))
+      if [[ -n ${size_of[$fpat]+x} ]]; then
+        local sw sh; read -r sw sh <<< "${size_of[$fpat]}"
+        apply_saved_size "$faddr" "$dir" "$sw" "$sh"
+      fi
     done
   else
     # No tree recorded (see infer_tree/cmd_save): fall back to plain file
