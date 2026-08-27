@@ -562,6 +562,21 @@ cmd_load() {
         apply_saved_size "$faddr" "$dir" "$sw" "$sh"
       fi
     done
+    # Hyprland can reset a split's ratio when the window on one side is
+    # later subdivided again (its node becomes an internal split, not a
+    # leaf) -- e.g. telegram's r-split-vs-slack width resets once telegram
+    # itself gets d-split against whatsapp. The inline resizes above can
+    # therefore get silently undone by a later step. Now that the whole
+    # tree is built and nothing else will restructure it, redo every saved
+    # size once more so each one has the last word.
+    for line in "${splits[@]+"${splits[@]}"}"; do
+      IFS=$'\t' read -r fpat dir npat <<< "$line"
+      [[ -n ${size_of[$fpat]+x} ]] || continue
+      faddr=$(find_window "$fpat")
+      [[ -n $faddr ]] || continue
+      local sw sh; read -r sw sh <<< "${size_of[$fpat]}"
+      apply_saved_size "$faddr" "$dir" "$sw" "$sh"
+    done
   else
     # No tree recorded (see infer_tree/cmd_save): fall back to plain file
     # order. A launch is awaited before the next entry starts, and every
