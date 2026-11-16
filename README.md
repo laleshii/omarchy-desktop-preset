@@ -101,6 +101,25 @@ From the desktop: open the Omarchy menu → **Trigger → Preset → Load / Save
 Clear desktop**. Each pops its own picker (no terminal needed) and reports
 the result as a notification.
 
+`load` reuses matching windows **on the target workspace**. If none exists
+there, it launches the recorded command and waits for a matching **new window
+address** (up to 20 seconds; override with `DESKTOP_PRESET_TIMEOUT`). It leaves
+existing windows on other workspaces in place. This also applies to manual
+loads: move a window to the target workspace yourself if you want it reused.
+Presets on different workspaces can therefore restore separate windows of
+the same application.
+
+The launch command must open a separate window when the app is already
+running. For GNOME Files, `load` adds `--new-window` to the exact argument-free
+commands `nautilus` and `/usr/bin/nautilus`, optionally prefixed by
+`uwsm-app -- `. Commands with arguments, other wrappers, or shell syntax are
+run unchanged: edit those presets to request a new window explicitly, e.g.
+`uwsm-app -- nautilus --new-window "file:///path/to/folder"` (see
+[nautilus(1)](https://man.archlinux.org/man/nautilus.1.en)). Other apps need
+their own supported new-window command; no generic flag is added. If no new
+matching window appears, `load` reports a timeout and leaves the existing
+windows in place. Normal application launches outside `load` are unaffected.
+
 ## Auto-load at login
 
 Pin a preset to a workspace and it loads automatically the next time you log
