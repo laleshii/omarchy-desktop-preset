@@ -5,14 +5,21 @@
 # @anchor/@split directives recording the exact dwindle split tree (see
 # infer_tree), @size directives recording each split's exact ratio, and
 # @float lines for floating windows' exact position/size. Loading replays
-# the tree via focus+preselect+resize, moving windows that already exist
-# rather than launching duplicates.
+# the tree via focus+preselect+resize, reusing windows on the target workspace
+# and launching new ones without taking windows from other workspaces.
 
 set -uo pipefail
+
+# Keep the legacy reader intact; new snapshots use a typed instance schema.
+V2="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/desktop-preset-v2"
+case ${1:-} in
+  save|location|inspect|validate) exec python3 "$V2" "$@" ;;
+esac
 
 DIR="${DESKTOP_PRESET_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/desktop_preset}"
 LAUNCH_TIMEOUT="${DESKTOP_PRESET_TIMEOUT:-20}"
 DRY=0; CLEAR=0; ASSUME_YES=0; WS=""; CLOSE_TERM=-1; FORCE=0; NAMES_ONLY=0; RAW=0   # -1 = follow preset directive
+RETRY_PENDING=0
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
@@ -35,6 +42,9 @@ usage:
   desktop_preset save <name> [-f]         draft a preset from this workspace
   desktop_preset clear [options]          close windows on a workspace
   desktop_preset edit <name>              open a preset in $EDITOR
+  desktop_preset inspect [-w N]          show instance addresses and known URIs
+  desktop_preset validate NAME           report URI coverage and Home fallback
+  desktop_preset location set NAME ID URI  set a v2 Nautilus instance location
   desktop_preset autostart list [--raw]   show which workspace loads what at login
   desktop_preset autostart set <name> -w N    auto-load <name> on workspace N at login
   desktop_preset autostart unset -w N     stop auto-loading on workspace N
@@ -52,6 +62,12 @@ load-only options:
 
 save-only options:
   -f, --force               overwrite an existing preset of the same name
+      --location ADDRESS URI  explicitly capture this Nautilus window's URI
+      --interactive           offer a folder/URI dialog for each unknown window
+      --non-interactive       keep unknown URI null; load uses Home
+
+v2 load recovery:
+      --retry-pending       explicitly retry a timed-out launch after inspection
 
 autostart:
   a mapping of workspace -> preset name, stored at
@@ -78,12 +94,12 @@ presets live in ~/.config/desktop_preset/<name>.preset
   @float <pattern> <x> <y> <w> <h>       exact position/size for a floating
                                           window (written by save)
 
-save reconstructs the actual dwindle split tree from each window's saved
-position and size and records it exactly as @anchor/@split/@size — this is
-what loading replays, so both the split shape and ratio come back exact, not
-guessed. Falls back to plain reading order (no @anchor) when two windows
-share the same pattern (their identity is ambiguous) or with more than 10
-windows.
+New saves use version 2 JSON: distinct instance IDs, argv arrays, per-node
+split ratios and per-window locations. Legacy text files remain readable.
+save --force backs up and recaptures the current workspace; it does not
+recover locations or geometry absent from an old file. Save uses explicit
+locations, proven D-Bus capture, then per-window interactive selection.
+Unknown/unavailable Nautilus locations use Home on load without login prompts.
 USAGE
 }
 
@@ -101,11 +117,15 @@ ws_addrs() {
 }
 
 # Same matching rule omarchy-launch-or-focus uses: word-boundary, case
-# insensitive, against class or title.
+# insensitive, against class or title. An empty workspace permits any workspace
+# (used only for newly launched windows); exclude contains pre-launch addresses.
 find_window() {
-  hyprctl clients -j | jq -r --arg p "$1" \
-    '.[]|select((.class|test("\\b"+$p+"\\b";"i")) or (.title|test("\\b"+$p+"\\b";"i")))|.address' \
-    | head -n1
+  hyprctl clients -j | jq -r --arg p "$1" --arg ws "$2" --argjson exclude "${3:-[]}" '
+    first(.[]
+      | select($ws == "" or (.workspace.id|tostring) == $ws)
+      | select(.address as $a | ($exclude|index($a)) == null)
+      | select((.class|test("\\b"+$p+"\\b";"i")) or (.title|test("\\b"+$p+"\\b";"i")))
+      | .address) // empty'
 }
 
 describe() { hyprctl clients -j | jq -r --arg a "$1" '.[]|select(.address==$a)|"\(.class) — \(.title)"' | head -n1; }
@@ -167,9 +187,10 @@ apply_saved_size() {
 }
 
 wait_for_window() {
-  local pat=$1 i
+  local pat=$1 before=$2 addr i
   for ((i = 0; i < LAUNCH_TIMEOUT * 10; i++)); do
-    [[ -n $(find_window "$pat") ]] && return 0
+    addr=$(find_window "$pat" "" "$before")
+    if [[ -n $addr ]]; then printf '%s\n' "$addr"; return 0; fi
     sleep 0.1
   done
   return 1
@@ -300,6 +321,7 @@ guess_launch_command() {
 
 preset_file() { printf '%s/%s.preset\n' "$DIR" "$1"; }
 autostart_file() { printf '%s/autostart.conf\n' "$DIR"; }
+is_v2() { [[ $(LC_ALL=C awk 'NF {sub(/^[[:space:]]*/, ""); print substr($0,1,1); exit}' "$1") == '{' ]]; }
 
 # The actual dwindle split tree, reconstructed purely from each window's
 # saved position/size (see desktop-preset-layout for the algorithm and why
@@ -347,6 +369,11 @@ cmd_list() {
     found=1; n=$(basename "$f" .preset)
     if (( NAMES_ONLY )); then printf '%s\n' "$n"; continue; fi
     printf '\033[1m%s\033[0m\n' "$n"
+    if is_v2 "$f"; then
+      jq -r '.windows[] | "    \(.id)  \(.class)  location=\(.location_source // "n/a")"' "$f"
+      printf '\n'
+      continue
+    fi
     while IFS= read -r line; do
       [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
       if [[ $line =~ ^[[:space:]]*@ ]]; then
@@ -466,28 +493,48 @@ cmd_save() {
   cmd_show "$name"
 }
 
-# Resolve a preset pattern to a live address: reuse an already-open window,
-# or launch its recorded command and wait for it to appear. Prints progress
-# to stderr (so it interleaves correctly under `foo | while read`) and the
-# resolved address to stdout; empty stdout means "give up on this one".
+# Resolve a pattern on the target workspace, or launch and wait for a new
+# address. The third argument names the caller's result variable. cmd_load's
+# address_of caches both successes and failures, so repeated patterns don't
+# launch repeatedly and tree/size replay uses exactly the selected windows.
 resolve_or_launch() {
-  local p=$1 addr cmdline
-  addr=$(find_window "$p")
-  if [[ -n $addr ]]; then
-    printf '   found  %-26s %s\n' "$p" "($(describe "$addr"))" >&2
-    echo "$addr"; return 0
+  local p=$1 ws=$2 cmdline before
+  local -n resolved=$3
+  resolved=${address_of[$p]:-}
+  if [[ -n ${address_of[$p]+x} ]]; then
+    [[ -n $resolved ]]; return
+  fi
+  address_of[$p]=""
+  resolved=$(find_window "$p" "$ws")
+  if [[ -n $resolved ]]; then
+    printf '   found  %-26s %s\n' "$p" "($(describe "$resolved"))" >&2
+    address_of[$p]=$resolved
+    return 0
   fi
   cmdline=${command_of[$p]:-}
   if [[ -z $cmdline ]]; then warn "no launch command recorded for: $p"; return 1; fi
   if [[ $cmdline == *TODO\(* ]]; then warn "skipping unfinished entry: $p"; return 1; fi
+  # Only adapt these unambiguous, argument-free Nautilus commands. Arbitrary
+  # shell commands (including wrappers/arguments) must request a new window
+  # themselves; appending flags to them could change their meaning.
+  case $cmdline in
+    nautilus | /usr/bin/nautilus | 'uwsm-app -- nautilus' | 'uwsm-app -- /usr/bin/nautilus')
+      cmdline+=' --new-window' ;;
+  esac
   printf '   launch %-26s %s\n' "$p" "$cmdline" >&2
   if (( DRY )); then printf '   would: setsid bash -c %s\n' "$(printf '%q' "$cmdline")" >&2; return 1; fi
+  before=$(hyprctl clients -j | jq -c 'map(.address)') || {
+    warn "could not snapshot windows before launching: $p"; return 1;
+  }
   # bash -c re-parses $cmdline as shell syntax (quotes, etc); plain unquoted
   # expansion (`setsid $cmdline`) only word-splits the already-substituted
   # string and breaks on any command containing quoted arguments.
   setsid bash -c "$cmdline" >/dev/null 2>&1 &
-  if wait_for_window "$p"; then find_window "$p"; return 0; fi
-  warn "timed out after ${LAUNCH_TIMEOUT}s waiting for: $p"
+  if resolved=$(wait_for_window "$p" "$before"); then
+    address_of[$p]=$resolved
+    return 0
+  fi
+  warn "timed out after ${LAUNCH_TIMEOUT}s waiting for a new window: $p (the command must open a separate window; existing windows on other workspaces were left in place)"
   return 1
 }
 
@@ -498,13 +545,29 @@ cmd_load() {
   ws=${WS:-$(cur_ws)}
   [[ $ws =~ ^[0-9]+$ ]] || die "workspace must be a number: $ws"
 
+  if is_v2 "$f"; then
+    local -a args=(load "$name" -w "$ws")
+    (( DRY )) && args+=(--dry-run)
+    (( CLEAR )) && args+=(--clear)
+    (( ASSUME_YES )) && args+=(--yes)
+    (( RETRY_PENDING )) && args+=(--retry-pending)
+    (( CLOSE_TERM == 1 )) && warn "v2 leaves the calling terminal open; use the menu for an unobstructed target workspace"
+    python3 "$V2" "${args[@]}"
+    return $?
+  fi
+  if awk -F '|' '!/^[[:space:]]*(#|@|$)/ {gsub(/[[:space:]]+$/, "", $1); if (seen[$1]++) exit 1}' "$f"; then
+    :
+  else
+    warn "legacy duplicate patterns cannot identify individual windows or recover missing geometry/locations; explicitly recapture with save --force"
+  fi
+
   grep -qE '^[[:space:]]*@close-terminal[[:space:]]*$' "$f" && want_close=1
   (( CLOSE_TERM == 1 )) && want_close=1
   (( CLOSE_TERM == 0 )) && want_close=0
 
-  # Launch dictionary (pattern -> command); resolve_or_launch reads this as
-  # a global. `order` is file order, used only by the no-tree fallback.
-  declare -gA command_of=()
+  # Bash's dynamic scope makes these per-load dictionaries available to
+  # resolve_or_launch. `order` is file order for the no-tree fallback.
+  local -A command_of=() address_of=()
   local -a order=() splits=() floats=()
   local -A is_floating=() size_of=()
   local anchor="" pat cmd
@@ -540,7 +603,7 @@ cmd_load() {
     # whose slot is being divided, preselects which side the new window
     # takes, then places it there — Hyprland does the rest. See infer_tree.
     local addr faddr naddr dir fpat npat
-    addr=$(resolve_or_launch "$anchor") && {
+    resolve_or_launch "$anchor" "$ws" addr && {
       stage_bounce_if_needed "$addr" "$ws"
       act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$ws\", follow = false, window = \"address:$addr\" })"
       (( DRY )) || sleep 0.15
@@ -548,11 +611,11 @@ cmd_load() {
     }
     for line in "${splits[@]+"${splits[@]}"}"; do
       IFS=$'\t' read -r fpat dir npat <<< "$line"
-      faddr=$(find_window "$fpat")
+      faddr=${address_of[$fpat]:-}
       if [[ -z $faddr ]]; then warn "lost track of '$fpat' — stopping tree replay early"; break; fi
       act hyprctl dispatch "hl.dsp.focus({ window = \"address:$faddr\" })"
       act hyprctl dispatch "hl.dsp.layout(\"preselect $dir\")"
-      naddr=$(resolve_or_launch "$npat") || continue
+      resolve_or_launch "$npat" "$ws" naddr || continue
       stage_bounce_if_needed "$naddr" "$ws"
       act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$ws\", window = \"address:$naddr\" })"
       (( DRY )) || sleep 0.15
@@ -572,7 +635,7 @@ cmd_load() {
     for line in "${splits[@]+"${splits[@]}"}"; do
       IFS=$'\t' read -r fpat dir npat <<< "$line"
       [[ -n ${size_of[$fpat]+x} ]] || continue
-      faddr=$(find_window "$fpat")
+      faddr=${address_of[$fpat]:-}
       [[ -n $faddr ]] || continue
       local sw sh; read -r sw sh <<< "${size_of[$fpat]}"
       apply_saved_size "$faddr" "$dir" "$sw" "$sh"
@@ -585,7 +648,7 @@ cmd_load() {
     local addr
     for pat in "${order[@]+"${order[@]}"}"; do
       [[ -n ${is_floating[$pat]+x} ]] && continue
-      addr=$(resolve_or_launch "$pat") || continue
+      resolve_or_launch "$pat" "$ws" addr || continue
       place "$addr" "$ws"; placed+=("$addr"); (( n++ ))
     done
   fi
@@ -593,7 +656,7 @@ cmd_load() {
   for line in "${floats[@]+"${floats[@]}"}"; do
     local fx fy fw fh addr
     IFS=$'\t' read -r pat fx fy fw fh <<< "$line"
-    addr=$(resolve_or_launch "$pat") || continue
+    resolve_or_launch "$pat" "$ws" addr || continue
     act hyprctl dispatch "hl.dsp.window.move({ workspace = \"$ws\", follow = false, window = \"address:$addr\" })"
     act hyprctl dispatch "hl.dsp.window.float({ action = \"enable\", window = \"address:$addr\" })"
     act hyprctl dispatch "hl.dsp.window.resize({ x = $fw, y = $fh, window = \"address:$addr\" })"
@@ -681,7 +744,7 @@ cmd_autostart_unset() {
 # this got invoked by hand after login, and clobbering someone's in-progress
 # work would be the wrong default.
 cmd_autostart_run() {
-  local f ws name
+  local f ws name rc=0
   f=$(autostart_file)
   [[ -s $f ]] || { info "no autostart entries configured"; return 0; }
   while IFS='=' read -r ws name; do
@@ -691,8 +754,9 @@ cmd_autostart_run() {
       continue
     fi
     info "autostart: loading '$name' onto workspace $ws"
-    WS=$ws cmd_load "$name"
+    WS=$ws cmd_load "$name" || rc=1
   done < "$f"
+  return "$rc"
 }
 
 # --- main -----------------------------------------------------------------
@@ -712,6 +776,7 @@ while (( $# )); do
     -f|--force)           FORCE=1; shift ;;
     --names)              NAMES_ONLY=1; shift ;;
     --raw)                RAW=1; shift ;;
+    --retry-pending)      RETRY_PENDING=1; shift ;;
     -n|--dry-run)         DRY=1; shift ;;
     -h|--help)            usage; exit 0 ;;
     --)                   shift; while (( $# )); do POS+=("$1"); shift; done ;;
@@ -720,6 +785,15 @@ while (( $# )); do
   esac
 done
 set -- "${POS[@]+"${POS[@]}"}"
+
+case $sub in
+  show|edit|load)
+    [[ ${1:-} =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid preset name" ;;
+  autostart)
+    if [[ ${1:-} == set ]]; then
+      [[ ${2:-} =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid preset name"
+    fi ;;
+esac
 
 mkdir -p "$DIR"
 case $sub in

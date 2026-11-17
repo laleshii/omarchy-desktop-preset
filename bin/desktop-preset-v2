@@ -1,0 +1,1089 @@
+#!/usr/bin/env python3
+"""Versioned per-window snapshots; the Bash CLI retains the legacy reader."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import unquote, urlsplit
+
+
+def module_at(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+layout = module_at('desktop_preset_layout', Path(__file__).with_name('desktop-preset-layout'))
+NAUTILUS = 'org.gnome.Nautilus'
+
+
+class PresetError(Exception):
+    pass
+
+
+def warn(message):
+    print(f'warning: {message}', file=sys.stderr)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return default
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def backup(path):
+    if path.exists():
+        dest = path.with_name(path.name + f'.bak.{time.time_ns()}')
+        shutil.copy2(path, dest)
+        print(f'Backup: {dest}')
+
+
+def normalize_uri(value):
+    if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
+        raise PresetError('location must be a nonempty URI or absolute path')
+    if value.startswith(('~/', '/')) or value == '~':
+        return Path(value).expanduser().absolute().as_uri()
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise PresetError('invalid location URI') from exc
+    if not parsed.scheme or not re.fullmatch(r'[A-Za-z][A-Za-z0-9+.-]*', parsed.scheme):
+        raise PresetError('location must be a URI or absolute path')
+    if parsed.scheme == 'file' and (parsed.netloc not in ('', 'localhost') or
+                                    not parsed.path.startswith('/') or parsed.query or parsed.fragment or
+                                    re.search(r'%(?![0-9a-fA-F]{2})', parsed.path) or
+                                    '\x00' in unquote(parsed.path)):
+        raise PresetError('file URI must contain a local absolute path')
+    return value
+
+
+def check_location(uri):
+    uri = normalize_uri(uri)
+    parsed = urlsplit(uri)
+    if parsed.scheme == 'file':
+        path = Path(unquote(parsed.path))
+        if not path.is_dir() or not os.access(path, os.R_OK | os.X_OK):
+            raise PresetError('Nautilus directory is missing or inaccessible; mount it before loading')
+    return uri
+
+
+def uri_equal(a, b):
+    """GLib and pathlib escape allowed URI punctuation differently."""
+    if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        pa, pb = urlsplit(a), urlsplit(b)
+    except ValueError:
+        return False
+    if pa.scheme == pb.scheme == 'file':
+        return (pa.netloc in ('', 'localhost') and pb.netloc in ('', 'localhost') and
+                unquote(pa.path) == unquote(pb.path) and pa.query == pb.query and pa.fragment == pb.fragment)
+    try:
+        from gi.repository import Gio
+        return Gio.File.new_for_uri(a).equal(Gio.File.new_for_uri(b))
+    except (ImportError, ValueError):
+        return False
+
+
+def probe_remote(uri):
+    """No mounting/authentication UI. A child process enforces a hard timeout."""
+    try:
+        result = subprocess.run([sys.executable, __file__, '_probe-uri', uri],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=2.5)
+        return {0: 'available', 2: 'unavailable'}.get(result.returncode, 'unverified')
+    except (OSError, subprocess.TimeoutExpired):
+        return 'timeout'
+
+
+def effective_location(value, remote_probe=probe_remote):
+    """Return an ephemeral load target and reason; never rewrite the preset."""
+    reason = None
+    try:
+        if value is None:
+            raise PresetError('missing URI')
+        uri = check_location(value)
+        if urlsplit(uri).scheme != 'file':
+            status = remote_probe(uri)
+            if status != 'available':
+                reason = f'remote resource {status} (no mount/authentication attempted)'
+    except (PresetError, ValueError, OSError):
+        reason = 'missing URI' if value is None else 'invalid, missing or inaccessible location'
+    return (Path.home().as_uri(), reason) if reason else (uri, None)
+
+
+def notify_fallback(count):
+    # Never wait for a notification service, including during login.
+    if not count:
+        return
+    title = 'Desktop preset locations'
+    message = f'{count} Nautilus instance(s) use Home; see desktop_preset validate NAME.'
+    if shutil.which('notify-send'):
+        argv = ['notify-send', title, message]
+    elif shutil.which('omarchy'):
+        argv = ['omarchy', 'notification', 'send', title, message, '-g', '', '-u', 'normal']
+    else:
+        return
+    try:
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def validate(data):
+    if not isinstance(data, dict) or data.get('version') != 2:
+        raise PresetError('unsupported preset version (expected version 2)')
+    windows = data.get('windows')
+    if not isinstance(windows, list) or not windows:
+        raise PresetError('preset must contain windows')
+    ids = set()
+    tiled = set()
+    def numbers(values, count, positive=False):
+        return (isinstance(values, list) and len(values) == count and
+                all(type(v) in (int, float) and math.isfinite(v) and
+                    (not positive or v > 0) for v in values))
+    if not numbers(data.get('workarea'), 4) or min(data['workarea'][2:]) <= 0:
+        raise PresetError('invalid workarea')
+    for w in windows:
+        ident = w.get('id')
+        if not isinstance(ident, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', ident) or ident in ids:
+            raise PresetError('invalid or duplicate instance ID')
+        ids.add(ident)
+        if not isinstance(w.get('class'), str) or not w['class']:
+            raise PresetError(f'{ident}: missing exact class')
+        if type(w.get('floating')) is not bool:
+            raise PresetError(f'{ident}: floating must be boolean')
+        if not numbers(w.get('rect'), 4) or min(w['rect'][2:]) <= 0:
+            raise PresetError(f'{ident}: invalid rectangle')
+        argv = w.get('argv')
+        if argv is not None and (not isinstance(argv, list) or not argv or
+                                any(not isinstance(a, str) or '\x00' in a for a in argv)):
+            raise PresetError(f'{ident}: argv must be an array of strings or null')
+        if w.get('cwd') is not None and (not isinstance(w['cwd'], str) or
+                                        not Path(w['cwd']).is_absolute()):
+            raise PresetError(f'{ident}: cwd must be absolute or null')
+        # A broken historical Nautilus URI is a recoverable load condition.
+        if w.get('uri') is not None and w['class'] != NAUTILUS:
+            normalize_uri(w['uri'])
+        if not w['floating']:
+            tiled.add(ident)
+    leaves = []
+    def tree(node, depth=0):
+        if not isinstance(node, dict) or depth > 10:
+            raise PresetError('invalid or excessively deep tree')
+        if set(node) == {'id'}:
+            leaves.append(node['id'])
+            return
+        if set(node) != {'axis', 'ratio', 'first', 'second'} or node['axis'] not in ('x', 'y'):
+            raise PresetError('invalid split node')
+        ratio = node['ratio']
+        if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0.05 <= ratio <= 0.95:
+            raise PresetError('invalid split ratio')
+        tree(node['first'], depth + 1)
+        tree(node['second'], depth + 1)
+    if data.get('tree') is not None:
+        tree(data['tree'])
+    if set(leaves) != tiled or len(leaves) != len(tiled) or len(tiled) > 10:
+        raise PresetError('tree must reference every tiled instance exactly once (limit 10)')
+    return data
+
+
+class Hypr:
+    def query(self, *args):
+        result = subprocess.run(['hyprctl', *args, '-j'], text=True, capture_output=True, timeout=10)
+        if result.returncode:
+            raise PresetError(f'hyprctl {args[0]} failed: {result.stderr.strip()}')
+        try:
+            return json.loads(result.stdout)
+        except ValueError as exc:
+            raise PresetError(f'hyprctl {args[0]} returned invalid JSON') from exc
+
+    def clients(self):
+        return self.query('clients')
+
+    def dispatch(self, code):
+        result = subprocess.run(['hyprctl', 'dispatch', code], text=True, capture_output=True, timeout=10)
+        if result.returncode or result.stdout.strip() != 'ok':
+            raise PresetError(f'Hyprland dispatch failed: {result.stdout.strip()} {result.stderr.strip()}')
+
+    def focus(self, address):
+        self.dispatch(f'hl.dsp.focus({{ window = "address:{safe_address(address)}" }})')
+
+    def move(self, address, workspace, follow=False):
+        if not re.fullmatch(r'(?:[0-9]+|special:desktop_preset_v2_[0-9]+)', str(workspace)):
+            raise PresetError('invalid workspace selector')
+        self.dispatch(f'hl.dsp.window.move({{ workspace = "{workspace}", follow = {str(follow).lower()}, '
+                      f'window = "address:{safe_address(address)}" }})')
+
+    def option(self, name):
+        return self.query('getoption', name)
+
+    def context(self, ws):
+        spaces = self.query('workspaces')
+        space = next((s for s in spaces if s['id'] == ws), None)
+        if space and space.get('tiledLayout') != 'dwindle':
+            raise PresetError('v2 requires a Dwindle workspace')
+        monitors = self.query('monitors')
+        monitor = next((m for m in monitors if space and m['id'] == space['monitorID']), None)
+        monitor = monitor or next(m for m in monitors if m['focused'])
+        width, height = monitor['width'], monitor['height']
+        if monitor.get('transform', 0) % 2:
+            width, height = height, width
+        left, top, right, bottom = monitor['reserved']
+        scale = monitor['scale']
+        box = [monitor['x'] + left, monitor['y'] + top,
+               width / scale - left - right, height / scale - top - bottom]
+        return box
+
+    def check_policy(self):
+        if not self.option('dwindle:use_active_for_splits').get('bool'):
+            raise PresetError('Dwindle use_active_for_splits must be enabled; no global policy was changed')
+        if not (self.option('dwindle:preserve_split').get('bool') or
+                self.option('dwindle:smart_split').get('bool')):
+            raise PresetError('Dwindle preserve_split or smart_split is required; no global policy was changed')
+
+
+def safe_address(address):
+    if not re.fullmatch(r'0x[0-9a-fA-F]+', address):
+        raise PresetError('invalid compositor address')
+    return address
+
+
+def fingerprint(c):
+    pid = c.get('pid', 0)
+    try:
+        start = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    except (OSError, IndexError):
+        start = None
+    result = [pid, start, c.get('initialClass', c['class'])]
+    if c.get('stableId') is not None:
+        result.append(c['stableId'])
+    return result
+
+
+class Nautilus:
+    """Optional typed D-Bus access. Never infer a window mapping from list order."""
+    def __init__(self):
+        self.bus = None
+        self.error = None
+        try:
+            from gi.repository import Gio, GLib
+            self.Gio, self.GLib = Gio, GLib
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except Exception as exc:
+            self.error = str(exc)
+
+    def call(self, dest, path, interface, method, signature, args):
+        if self.bus is None:
+            raise PresetError('optional PyGObject/session D-Bus is unavailable')
+        flags = self.Gio.DBusCallFlags.NO_AUTO_START
+        result = self.bus.call_sync(dest, path, interface, method,
+                                    self.GLib.Variant(signature, args), None, flags, 700, None)
+        if method == 'Get' and args == ('org.freedesktop.FileManager1', 'OpenWindowsWithLocations'):
+            if result.get_type_string() != '(v)' or result.get_child_value(0).get_variant().get_type_string() != 'a{sas}':
+                raise PresetError('unexpected OpenWindowsWithLocations signature')
+        return result.unpack()
+
+    def snapshot(self):
+        owner = None
+        try:
+            owner = self.call('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                              'org.freedesktop.DBus', 'GetNameOwner', '(s)', (NAUTILUS,))[0]
+            manager_owner = self.call('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                                      'org.freedesktop.DBus', 'GetNameOwner', '(s)',
+                                      ('org.freedesktop.FileManager1',))[0]
+            if owner != manager_owner:
+                raise PresetError('FileManager1 belongs to another service')
+            pid = self.call('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                            'org.freedesktop.DBus', 'GetConnectionUnixProcessID', '(s)', (owner,))[0]
+            windows = self.call(owner, '/org/freedesktop/FileManager1',
+                                'org.freedesktop.DBus.Properties', 'Get', '(ss)',
+                                ('org.freedesktop.FileManager1', 'OpenWindowsWithLocations'))[0]
+            # Gio unpacks the typed GVariant; never parse gdbus pretty-printing.
+            if not isinstance(windows, dict) or any(
+                    not isinstance(p, str) or not re.fullmatch(r'/org/gnome/Nautilus/window/[0-9]+', p) or
+                    not isinstance(uris, list) or any(not isinstance(u, str) for u in uris)
+                    for p, uris in windows.items()):
+                raise PresetError('malformed OpenWindowsWithLocations')
+            for uris in windows.values():
+                for uri in uris:
+                    if not urlsplit(uri).scheme:
+                        raise PresetError('non-URI in OpenWindowsWithLocations')
+                    normalize_uri(uri)
+            again = self.call('org.freedesktop.DBus', '/org/freedesktop/DBus',
+                              'org.freedesktop.DBus', 'GetNameOwner', '(s)', (NAUTILUS,))[0]
+            if again != owner:
+                raise PresetError('D-Bus owner changed during capture')
+            self.error = None
+            return {'owner': owner, 'pid': pid, 'windows': windows}
+        except Exception as exc:
+            self.error = 'Nautilus typed D-Bus snapshot unavailable or invalid'
+            absent = False
+            if owner is None and hasattr(self, 'Gio'):
+                try:
+                    absent = self.Gio.DBusError.get_remote_error(exc) == 'org.freedesktop.DBus.Error.NameHasNoOwner'
+                except (AttributeError, TypeError):
+                    pass
+            return {'owner': None, 'windows': {}, 'absent': absent}
+
+    @staticmethod
+    def correlated(before, after):
+        if not after['owner'] or (before['owner'] and before['owner'] != after['owner']):
+            return None
+        if not before['owner'] and not before.get('absent'):
+            # Failed/delayed snapshots are not proof that no GTK windows existed.
+            return None
+        old = before['windows']
+        paths = set(after['windows']) - set(old)
+        return next(iter(paths)) if len(paths) == 1 else None
+
+    @staticmethod
+    def location(snapshot, binding):
+        if binding and snapshot['owner'] == binding.get('owner'):
+            locations = snapshot['windows'].get(binding.get('object'), [])
+            # Nautilus exports all tab locations without an active-tab guarantee.
+            if len(locations) == 1:
+                return locations[0]
+        return None
+
+    def go_home(self, binding):
+        self.call(binding['owner'], binding['object'], 'org.gtk.Actions', 'Activate',
+                  '(sava{sv})', ('go-home', [], {}))
+
+
+def capture_locations(hypr, runtime, nautilus):
+    """Complete global singleton, or an existing exact runtime correlation.
+
+    Two stable inventories fence navigation, process restarts and window churn.
+    Counts include ALL workspaces. Titles, sizes, tab order and PID alone never
+    establish a GTK-object association.
+    """
+    first = nautilus.snapshot()
+    clients = [c for c in hypr.clients() if c['class'] == NAUTILUS]
+    second = nautilus.snapshot()
+    current = [c for c in hypr.clients() if c['class'] == NAUTILUS]
+    signature = lambda cs: sorted((c['address'], fingerprint(c)) for c in cs)
+    if first != second or signature(clients) != signature(current) or not second['owner']:
+        return {}, second
+    bindings = {}
+    for c in current:
+        binding = runtime.binding(c)
+        if binding and binding.get('owner') == second['owner'] and binding.get('object') in second['windows']:
+            if 'pid' not in second or second['pid'] == c.get('pid'):
+                bindings[c['address']] = dict(binding)
+    if (len(current) == len(second['windows']) == 1 and second.get('pid', -1) == current[0].get('pid')
+            and current[0].get('mapped', True) and not current[0].get('xwayland', False)):
+        c = current[0]
+        bindings.setdefault(c['address'], {'owner': second['owner'],
+                            'object': next(iter(second['windows'])), 'fingerprint': fingerprint(c),
+                            'method': 'singleton-dbus'})
+    # A stale/corrupt journal must never associate one GTK object with two addresses.
+    objects = [(b['owner'], b['object']) for b in bindings.values()]
+    bindings = {a: b for a, b in bindings.items() if objects.count((b['owner'], b['object'])) == 1}
+    return bindings, second
+
+
+class LocationPicker:
+    """Explicit save-only UI adapter. Neither load nor login calls this class."""
+    def __init__(self, hypr, interactive=None):
+        self.hypr = hypr
+        self.enabled = sys.stdin.isatty() if interactive is None else interactive
+        self.display = bool(os.environ.get('WAYLAND_DISPLAY') or os.environ.get('DISPLAY'))
+
+    def dialog(self, argv):
+        try:
+            result = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
+                                    text=True, timeout=300)
+            return result.stdout.rstrip('\n') if result.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def choose(self, c, ident, choices):
+        if not self.enabled:
+            return None
+        gui = next((x for x in ('zenity', 'yad', 'omarchy-menu-input')
+                    if self.display and shutil.which(x)), None)
+        if not gui and not sys.stdin.isatty():
+            return None
+        # Identify exactly this window without changing its folder or clipboard.
+        self.hypr.focus(c['address'])
+        label = f'Nautilus {ident}, workspace {c["workspace"]["id"]}, {c["address"]}'
+        prompt = label + ': choose its target folder/URI; cancel keeps unknown (Home on load)'
+        if gui == 'omarchy-menu-input':
+            return self.dialog([gui, prompt]) or None
+        if gui:
+            mode = self.dialog([gui, '--list', '--title=' + label, '--text=' + prompt,
+                                '--separator=', '--column=Location', 'Choose local folder', 'Enter URI or path',
+                                'Leave unknown'])
+            if mode == 'Choose local folder':
+                return self.dialog([gui, '--file-selection', '--directory', '--title=' + label]) or None
+            if mode == 'Enter URI or path':
+                return self.dialog([gui, '--entry', '--title=' + label, '--text=' + prompt]) or None
+            return None
+        print(prompt, file=sys.stderr)
+        for index, uri in enumerate(choices, 1):
+            print(f'  {index}: {uri}', file=sys.stderr)
+        try:
+            value = input('Absolute path, URI, tab number, or Enter to leave unknown: ').strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if value.isdigit() and 1 <= int(value) <= len(choices):
+            return choices[int(value) - 1]
+        return value or None
+
+
+def explicit_location(runtime, c):
+    entry = runtime.data.get('explicit', {}).get(c['address'])
+    return entry.get('uri') if entry and entry.get('fingerprint') == fingerprint(c) else None
+
+
+class Runtime:
+    def __init__(self, root=None):
+        session = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE', 'unknown')
+        self.root = Path(root or os.environ.get('DESKTOP_PRESET_RUNTIME_DIR') or
+                         Path(os.environ.get('XDG_RUNTIME_DIR', tempfile.gettempdir())) /
+                         f'desktop-preset-{os.getuid()}')
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.root.stat().st_uid != os.getuid() or self.root.stat().st_mode & 0o077:
+            raise PresetError('runtime directory must be private and owned by this user')
+        self.path = self.root / (hashlib.sha256(session.encode()).hexdigest()[:20] + '.json')
+        self.data = read_json(self.path, {'loads': {}, 'nautilus': {}})
+
+    def persist(self):
+        atomic_json(self.path, self.data)
+
+    def key(self, path, ws):
+        return hashlib.sha256(str(path.resolve()).encode() + path.read_bytes()).hexdigest() + f':{ws}'
+
+    def binding(self, c):
+        binding = self.data['nautilus'].get(c['address'])
+        return binding if binding and binding.get('fingerprint') == fingerprint(c) else None
+
+    @contextlib.contextmanager
+    def lock(self):
+        with (self.root / 'load.lock').open('w') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            # Another process may have completed a load while we were waiting.
+            self.data = read_json(self.path, {'loads': {}, 'nautilus': {}})
+            yield
+
+
+def launch_info(c):
+    cls = c['class']
+    if cls == NAUTILUS:
+        return ['nautilus', '--new-window'], None
+    if cls.startswith('chrome-') and '__' in cls:
+        return ['omarchy-launch-webapp', 'https://' + cls[7:].split('__')[0] + '/'], None
+    if cls.startswith('org.omarchy.'):
+        return ['omarchy-launch-tui', cls[len('org.omarchy.'):]], None
+    try:
+        proc = Path('/proc') / str(c['pid'])
+        argv = [os.fsdecode(a) for a in (proc / 'cmdline').read_bytes().rstrip(b'\0').split(b'\0')]
+        if argv and Path(argv[0]).is_file() and os.access(argv[0], os.X_OK):
+            cwd = os.readlink(proc / 'cwd')
+            # A terminal's shell/session is not recreated. Its process argv is data.
+            return argv, cwd if Path(cwd).is_dir() else None
+    except (KeyError, OSError):
+        pass
+    dirs = [Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share')) / 'applications',
+            Path('/usr/share/applications')]
+    for directory in dirs:
+        files = sorted(directory.glob('*.desktop'), key=lambda p: p.stem.lower() != cls.lower())
+        for file in files:
+            section = False
+            values = {}
+            for line in file.read_text(errors='replace').splitlines():
+                if line.startswith('['):
+                    section = line == '[Desktop Entry]'
+                elif section and '=' in line:
+                    key, value = line.split('=', 1)
+                    values[key] = value
+            if file.stem.lower() != cls.lower() and values.get('StartupWMClass', '').lower() != cls.lower():
+                continue
+            try:
+                argv = [a.replace('%%', '%') for a in shlex.split(values.get('Exec', ''))
+                        if not re.fullmatch(r'%[A-Za-z]', a)]
+            except ValueError:
+                continue
+            if argv:
+                return argv, None
+    return None, None
+
+
+def record(w, c):
+    result = {'address': c['address'], 'fingerprint': fingerprint(c), 'class': w['class']}
+    if w.get('_fallback'):
+        result['fallback_uri'] = w['uri']
+    return result
+
+
+def matches(w, c):
+    return w['class'] in (c.get('class'), c.get('initialClass'))
+
+
+def save(path, ws, force, overrides, hypr, runtime, nautilus, picker=None):
+    if path.exists() and not force:
+        raise PresetError('preset exists; use save --force for an explicit backed-up recapture')
+    hypr.check_policy()
+    workarea = hypr.context(ws)
+    clients = sorted([c for c in hypr.clients() if c['workspace']['id'] == ws],
+                     key=lambda c: (*c['at'], c['address']))
+    if not clients:
+        raise PresetError('workspace is empty')
+    unknown = set(overrides) - {c['address'] for c in clients if c['class'] == NAUTILUS}
+    if unknown:
+        raise PresetError('location overrides must reference Nautilus addresses on the saved workspace')
+    overrides = {address: normalize_uri(uri) for address, uri in overrides.items()}
+    bindings, snapshot = capture_locations(hypr, runtime, nautilus) if any(
+        c['class'] == NAUTILUS for c in clients) else ({}, None)
+    picker = picker or LocationPicker(hypr, False)
+    windows, journal = [], {}
+    for index, c in enumerate(clients, 1):
+        if c.get('fullscreen') or c.get('grouped'):
+            raise PresetError('fullscreen/grouped windows are unsupported; leave that mode before saving')
+        ident = f'w{index}'
+        argv, cwd = launch_info(c)
+        w = {'id': ident, 'class': c['class'], 'title_hint': c.get('title', ''),
+             'argv': argv, 'cwd': cwd, 'floating': c['floating'], 'rect': c['at'] + c['size']}
+        if c['class'] == NAUTILUS:
+            binding = bindings.get(c['address'])
+            uri = overrides.get(c['address']) or explicit_location(runtime, c)
+            source = 'explicit' if uri else None
+            if not uri:
+                uri = nautilus.location(snapshot, binding)
+                source = binding.get('method', 'correlated-dbus') if uri else None
+            if not uri:
+                # Tab candidates are offered only for a proven window binding.
+                choices = snapshot['windows'].get(binding['object'], []) if binding else []
+                while True:
+                    uri = picker.choose(c, ident, choices)
+                    try:
+                        if uri:
+                            normalize_uri(uri)
+                        break
+                    except PresetError as exc:
+                        warn(str(exc))
+                source = 'explicit' if uri else 'unavailable'
+            w['uri'] = normalize_uri(uri) if uri else None
+            w['location_source'] = source
+            w['location_confidence'] = 'user-confirmed' if source == 'explicit' else 'proven' if uri else 'unknown'
+            if uri and source == 'explicit':
+                runtime.data.setdefault('explicit', {})[c['address']] = {
+                    'fingerprint': fingerprint(c), 'uri': w['uri']}
+            if binding:
+                runtime.data['nautilus'][c['address']] = binding
+            if not uri:
+                warn(f'{ident} ({c["address"]}): active Nautilus location unavailable; '
+                     'saved as null; load will open a separate Home window. '
+                     'Recapture with save --force --interactive or use --location ADDRESS URI')
+        if argv is None:
+            warn(f'{ident}: launch argv unavailable; edit argv before cold loading')
+        windows.append(w)
+        journal[ident] = record(w, c)
+        print(f'{ident}: {c["address"]} {c["class"]}')
+    # A graphical picker may briefly tile itself and close asynchronously.
+    expected = {c['address']: fingerprint(c) for c in clients}
+    deadline = time.monotonic() + 1
+    while True:
+        latest = [c for c in hypr.clients() if c['workspace']['id'] == ws]
+        if {c['address']: fingerprint(c) for c in latest} == expected:
+            break
+        if time.monotonic() >= deadline:
+            raise PresetError('workspace window inventory changed during capture; save again')
+        time.sleep(.05)
+    by_address = {c['address']: c for c in latest}
+    final_snapshot = nautilus.snapshot() if bindings else snapshot
+    rects = []
+    for w, original in zip(windows, clients):
+        c = by_address[original['address']]
+        if c.get('fullscreen') or c.get('grouped'):
+            raise PresetError('window entered fullscreen/grouped mode during capture; save again')
+        w['rect'], w['floating'] = c['at'] + c['size'], c['floating']
+        if not c['floating']:
+            rects.append(dict(zip(('id', 'x', 'y', 'w', 'h'), [w['id'], *w['rect']])))
+        if w.get('location_source') in ('singleton-dbus', 'correlated-dbus'):
+            uri = nautilus.location(final_snapshot, bindings.get(c['address']))
+            w['uri'] = normalize_uri(uri) if uri else None
+            if not uri:
+                w['location_source'], w['location_confidence'] = 'unavailable', 'unknown'
+                warn(f'{w["id"]}: D-Bus location changed during selection; saved null, load uses Home')
+    data = validate({'version': 2, 'workarea': workarea, 'windows': windows,
+                     'tree': layout.infer_v2(rects, workarea)})
+    backup(path)
+    atomic_json(path, data)
+    runtime.data['loads'][runtime.key(path, ws)] = {'instances': journal}
+    runtime.persist()
+    print(f'Saved {len(windows)} instances: {path}')
+    return data
+
+
+class Loader:
+    def __init__(self, hypr, runtime, nautilus, timeout=20):
+        self.h, self.rt, self.n = hypr, runtime, nautilus
+        self.timeout = timeout
+        self.wait = 0.1
+        self.processes = []
+
+    def uri(self, c, snapshot):
+        return self.n.location(snapshot, self.rt.binding(c))
+
+    def plan(self, data, path, ws):
+        clients = self.h.clients()
+        local = [c for c in clients if c['workspace']['id'] == ws]
+        snapshot = self.n.snapshot()
+        state = self.rt.data['loads'].get(self.rt.key(path, ws), {'instances': {}})
+        by_address = {c['address']: c for c in local}
+        selected, consumed = {}, set()
+        unresolved = []
+        for w in data['windows']:
+            old = state['instances'].get(w['id'], {})
+            c = by_address.get(old.get('address'))
+            if c and old.get('fingerprint') == fingerprint(c) and matches(w, c):
+                if c['address'] in consumed:
+                    raise PresetError('journal assigns one address to multiple instances')
+                if w['class'] == NAUTILUS and w.get('uri'):
+                    if old.get('fallback_uri'):
+                        w['uri'], w['_fallback'] = old['fallback_uri'], True
+                        self.fallbacks.setdefault(w['id'], 'reusing the session Home fallback')
+                    actual = self.uri(c, snapshot)
+                    if self.rt.binding(c) and actual is None and not w.get('_fallback'):
+                        raise PresetError(f'{w["id"]}: tracked Nautilus active location cannot be verified '
+                                          '(multiple tabs or changed D-Bus state); refusing an uncertain reuse')
+                    if actual is not None and not uri_equal(actual, w['uri']) and not w.get('_fallback'):
+                        raise PresetError(f'{w["id"]}: tracked Nautilus location changed; refusing to swap folders')
+                    if actual is None:
+                        warn(f'{w["id"]}: reusing the explicit saved address association; '
+                             'the current Nautilus location cannot be verified for this untracked window')
+                selected[w['id']] = c
+                consumed.add(c['address'])
+            else:
+                unresolved.append(w)
+        # Preflight all reuse before mutations. Exact-class/title matching is
+        # only a hint, never a persistent identity for indistinguishable windows.
+        for w in unresolved:
+            candidates = [c for c in local if c['address'] not in consumed and matches(w, c)]
+            if w['class'] == NAUTILUS:
+                candidates = [c for c in candidates if uri_equal(self.uri(c, snapshot), w.get('uri'))]
+            else:
+                same_class = [p for p in unresolved if p['class'] == w['class']]
+                if candidates and len(same_class) > 1:
+                    hinted = [c for c in candidates if c.get('title') == w.get('title_hint')]
+                    if len(hinted) != 1:
+                        raise PresetError('ambiguous occupied workspace; exact instance association unavailable')
+                    candidates = hinted
+            if len(candidates) > 1:
+                hinted = [c for c in candidates if c.get('title') == w.get('title_hint')]
+                if len(hinted) == 1:
+                    candidates = hinted
+            peers = [p for p in unresolved if p['class'] == w['class'] and
+                     (p.get('uri') == w.get('uri') if w['class'] == NAUTILUS else
+                      p.get('title_hint') == w.get('title_hint'))]
+            if candidates and (len(candidates) != 1 or len(peers) != 1):
+                raise PresetError('ambiguous occupied workspace; save to bind instances or use an empty workspace')
+            if candidates:
+                selected[w['id']] = candidates[0]
+                consumed.add(candidates[0]['address'])
+        extras = [c for c in local if c['address'] not in consumed]
+        if extras:
+            raise PresetError('workspace contains unassigned windows; refusing to change their layout (use an empty workspace)')
+        for w in data['windows']:
+            if w['id'] in selected:
+                continue
+            if state['instances'].get(w['id'], {}).get('pending'):
+                raise PresetError(f'{w["id"]}: previous launch is unresolved; inspect late windows, then use '
+                                  'load --retry-pending explicitly')
+            if w['class'] == NAUTILUS:
+                pass  # Locations were resolved independently, with per-instance Home fallback.
+            elif not w.get('argv'):
+                raise PresetError(f'{w["id"]}: launch argv unavailable; edit the preset')
+            if w['class'] != NAUTILUS and w.get('cwd') and not Path(w['cwd']).is_dir():
+                raise PresetError(f'{w["id"]}: launch cwd unavailable')
+        return selected, state
+
+    def launch(self, w, ws, state, persist):
+        before = {c['address'] for c in self.h.clients()}
+        dbus_before = self.n.snapshot() if w['class'] == NAUTILUS else None
+        argv = ['nautilus', '--new-window', w['uri']] if w['class'] == NAUTILUS else w['argv']
+        state['instances'][w['id']] = {'pending': True, 'before': sorted(before)}
+        persist()
+        print(f'Launch {w["id"]}: {shlex.join(argv)}')
+        try:
+            proc = subprocess.Popen(argv, cwd=w.get('cwd'), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+            self.processes.append(proc)
+        except OSError as exc:
+            state['instances'].pop(w['id'])
+            persist()
+            raise PresetError(f'{w["id"]}: launch failed: {exc}') from exc
+        deadline = time.monotonic() + self.timeout
+        found = None
+        binding = None
+        verified = False
+        while time.monotonic() < deadline:
+            candidates = [c for c in self.h.clients() if c['address'] not in before and matches(w, c)]
+            if len(candidates) > 1:
+                raise PresetError(f'{w["id"]}: multiple new matching windows; refusing an unproven association')
+            if candidates:
+                found = candidates[0]
+                if w['class'] != NAUTILUS:
+                    break
+                after = self.n.snapshot()
+                obj = self.n.correlated(dbus_before, after)
+                if obj and ('pid' not in after or after['pid'] == found.get('pid')):
+                    binding = {'owner': after['owner'], 'object': obj,
+                               'fingerprint': fingerprint(found), 'method': 'correlated-dbus'}
+                    actual = self.n.location(after, binding)
+                    if uri_equal(actual, w['uri']):
+                        self.rt.data['nautilus'][found['address']] = binding
+                        verified = True
+                        break
+                if self.n.bus is None:
+                    warn(f'{w["id"]}: D-Bus verification unavailable; URI passed as argv, displayed folder unverified')
+                    break
+            time.sleep(self.wait)
+        else:
+            if found is None:
+                raise PresetError(f'{w["id"]}: timed out waiting for a new window'
+                                  '; pending launch retained to prevent blind duplicate retries')
+            # A Nautilus location/API error must not abort other instances/tree replay.
+            snapshot = self.n.snapshot()
+            if binding and snapshot['owner'] == binding['owner'] and binding['object'] in snapshot['windows']:
+                try:
+                    self.n.go_home(binding)
+                    self.fallbacks[w['id']] = 'requested URI could not be verified; requested Home on the proven new GTK window'
+                    w['uri'] = Path.home().as_uri()
+                    w['_fallback'] = True
+                    end = time.monotonic() + self.timeout
+                    while time.monotonic() < end:
+                        if uri_equal(self.n.location(self.n.snapshot(), binding), w['uri']):
+                            self.rt.data['nautilus'][found['address']] = binding
+                            verified = True
+                            break
+                        time.sleep(self.wait)
+                except Exception:
+                    warn(f'{w["id"]}: Nautilus Home navigation could not be verified')
+            if not verified:
+                warn(f'{w["id"]}: Nautilus displayed folder unverified (D-Bus correlation unavailable); '
+                     'the requested location was passed directly as argv')
+        # The selected address is new, never an old foreign-workspace match.
+        self.h.move(found['address'], ws)
+        state['instances'][w['id']] = record(w, found)
+        persist()
+        return found
+
+    def settle(self):
+        time.sleep(0.15)
+
+    def load(self, path, ws, dry=False, retry=False, clear=False, yes=False):
+        data = validate(read_json(path))
+        self.fallbacks = {}
+        for w in data['windows']:
+            if w['class'] == NAUTILUS:
+                w['uri'], reason = effective_location(w.get('uri'))
+                w['cwd'] = None  # Nautilus process cwd never identifies a window folder.
+                if reason:
+                    w['_fallback'] = True
+                    self.fallbacks[w['id']] = reason
+                    warn(f'{w["id"]}: {reason}; opening a separate Nautilus Home window')
+        self.h.check_policy()
+        workarea = self.h.context(ws)
+        key = self.rt.key(path, ws)
+        if dry:
+            print(f'Would reconcile {len(data["windows"])} distinct instances on workspace {ws}; '
+                  'stage, replay splits and verify rectangles. No launches or dispatches.')
+            if clear:
+                print('Would close windows on the target workspace first.')
+            return
+        if clear:
+            doomed = [c for c in self.h.clients() if c['workspace']['id'] == ws]
+            if doomed and not yes:
+                with open('/dev/tty', 'r+') as tty:
+                    tty.write(f'Close {len(doomed)} windows on workspace {ws}? [y/N] ')
+                    tty.flush()
+                    if tty.readline().strip().lower() != 'y':
+                        raise PresetError('aborted')
+            for c in doomed:
+                self.h.dispatch(f'hl.dsp.window.close({{ window = "address:{safe_address(c["address"])}" }})')
+            deadline = time.monotonic() + 4
+            while any(c['workspace']['id'] == ws for c in self.h.clients()):
+                if time.monotonic() > deadline:
+                    raise PresetError('some windows did not close')
+                time.sleep(self.wait)
+        if retry:
+            previous = self.rt.data['loads'].get(key, {'instances': {}})
+            previous['instances'] = {i: r for i, r in previous['instances'].items() if not r.get('pending')}
+            self.rt.persist()
+        selected, state = self.plan(data, path, ws)
+        self.rt.data['loads'][key] = state
+        def persist():
+            self.rt.persist()
+        for w in data['windows']:
+            if w['id'] not in selected:
+                self.h.dispatch(f'hl.dsp.focus({{ workspace = "{ws}" }})')
+                selected[w['id']] = self.launch(w, ws, state, persist)
+            else:
+                state['instances'][w['id']] = record(w, selected[w['id']])
+                persist()
+        addresses = {i: c['address'] for i, c in selected.items()}
+        # All existing windows must still be on the intended workspace.
+        self.assert_present(addresses, ws)
+        stage = f'special:desktop_preset_v2_{os.getpid()}'
+        try:
+            for w in data['windows']:
+                if w['floating']:
+                    self.h.dispatch('hl.dsp.window.float({ action = "enable", '
+                                    f'window = "address:{safe_address(addresses[w["id"]])}" }})')
+            for w in data['windows']:
+                if not w['floating']:
+                    self.h.move(addresses[w['id']], stage)
+            self.h.dispatch(f'hl.dsp.focus({{ workspace = "{ws}" }})')
+            anchor, steps = layout.steps_v2(data['tree'])
+            if anchor:
+                self.h.move(addresses[anchor], ws, True)
+                self.settle()
+                if self.current(addresses[anchor])['floating']:
+                    raise PresetError(f'{anchor}: compositor made a saved tiled window floating (size constraints)')
+            for step in steps:
+                self.assert_present(addresses, ws, allow_stage=True)
+                self.h.focus(addresses[step['focus']])
+                self.h.dispatch(f'hl.dsp.layout("preselect {step["dir"]}")')
+                self.h.move(addresses[step['new']], ws, True)
+                self.settle()
+                if self.current(addresses[step['new']])['floating']:
+                    raise PresetError(f'{step["new"]}: cannot tile under current application constraints')
+                self.h.focus(addresses[step['focus']])
+                self.h.dispatch(f'hl.dsp.layout("splitratio {2 * step["ratio"]:.10f} exact")')
+                self.settle()
+            for w in data['windows']:
+                if w['floating']:
+                    self.restore_float(w, addresses[w['id']], data['workarea'], workarea)
+            self.settle()
+            self.verify(data, addresses, ws, workarea)
+        finally:
+            # Never leave a selected window stranded on an invisible staging workspace.
+            for c in self.h.clients():
+                if c['address'] in addresses.values() and c['workspace'].get('name') == stage:
+                    self.h.move(c['address'], ws)
+            self.h.dispatch('hl.dsp.layout("preselect cancel")')
+        print(f'Restored {len(addresses)} distinct instances on workspace {ws}; geometry verified.')
+        if self.fallbacks:
+            warn('Home fallback: ' + ', '.join(sorted(self.fallbacks)) +
+                 '; other instances and Dwindle replay completed. Preset file unchanged.')
+            notify_fallback(len(self.fallbacks))
+
+    def current(self, address):
+        c = next((c for c in self.h.clients() if c['address'] == address), None)
+        if c is None:
+            raise PresetError('selected window closed during restore')
+        return c
+
+    def assert_present(self, addresses, ws, allow_stage=False):
+        if not allow_stage:
+            extras = [c for c in self.h.clients() if c['workspace']['id'] == ws
+                      and c['address'] not in addresses.values()]
+            if extras:
+                raise PresetError('unassigned window appeared during restore; stopping layout changes')
+        for address in addresses.values():
+            c = self.current(address)
+            name = c['workspace'].get('name', '')
+            if c['workspace']['id'] != ws and not (allow_stage and name.startswith('special:desktop_preset_v2_')):
+                raise PresetError('selected window moved during restore; refusing to take it back')
+
+    def restore_float(self, w, address, old, area):
+        x, y, width, height = w['rect']
+        width = min(width * area[2] / old[2], area[2])
+        height = min(height * area[3] / old[3], area[3])
+        x = max(area[0], min(area[0] + (x - old[0]) * area[2] / old[2], area[0] + area[2] - width))
+        y = max(area[1], min(area[1] + (y - old[1]) * area[3] / old[3], area[1] + area[3] - height))
+        selector = f'window = "address:{safe_address(address)}"'
+        self.h.dispatch(f'hl.dsp.window.float({{ action = "enable", {selector} }})')
+        self.h.dispatch(f'hl.dsp.window.resize({{ x = {round(width)}, y = {round(height)}, {selector} }})')
+        self.h.dispatch(f'hl.dsp.window.move({{ x = {round(x)}, y = {round(y)}, {selector} }})')
+
+    def verify(self, data, addresses, ws, area):
+        self.assert_present(addresses, ws)
+        actual = {c['address']: c for c in self.h.clients()}
+        old = data['workarea']
+        worst = 0
+        for w in data['windows']:
+            c = actual[addresses[w['id']]]
+            if bool(c['floating']) != w['floating']:
+                raise PresetError(f'{w["id"]}: floating state differs')
+            x, y, width, height = w['rect']
+            expected = [area[0] + (x - old[0]) * area[2] / old[2],
+                        area[1] + (y - old[1]) * area[3] / old[3],
+                        width * area[2] / old[2], height * area[3] / old[3]]
+            delta = max(abs(a - b) for a, b in zip(c['at'] + c['size'], expected))
+            worst = max(worst, delta)
+            if delta > 8:
+                raise PresetError(f'{w["id"]}: rendered geometry differs by {delta:.1f}px (tolerance 8px); '
+                                  'check gaps, monitor, minimum/maximum sizes and Dwindle settings')
+        print(f'Geometry maximum rectangle delta: {worst:.1f}px (tolerance 8px).')
+
+
+def location_report(data):
+    total = known = fallback = 0
+    for w in data['windows']:
+        if w['class'] != NAUTILUS:
+            continue
+        total += 1
+        try:
+            normalize_uri(w.get('uri'))
+            known += 1
+        except PresetError:
+            pass
+        target, reason = effective_location(w.get('uri'))
+        fallback += int(bool(reason))
+        print(json.dumps({'id': w['id'], 'source': w.get('location_source', 'legacy-v2'),
+                          'uri': w.get('uri'), 'load_uri': target, 'fallback': reason}, ensure_ascii=False))
+    print(f'Nautilus URI coverage: {known}/{total}; Home fallback: {fallback}/{total}. '
+          'Missing locations are recoverable; validation does not change the preset.')
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == '_probe-uri':
+        try:
+            from gi.repository import Gio
+            info = Gio.File.new_for_uri(sys.argv[2]).query_info('standard::type', Gio.FileQueryInfoFlags.NONE, None)
+            return 0 if info.get_file_type() == Gio.FileType.DIRECTORY else 2
+        except ImportError:
+            return 3
+        except Exception:
+            return 2
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=['save', 'load', 'location', 'inspect', 'validate'])
+    parser.add_argument('name', nargs='?')
+    parser.add_argument('extra', nargs='*')
+    parser.add_argument('-w', '--workspace', type=int)
+    parser.add_argument('-f', '--force', action='store_true')
+    parser.add_argument('-n', '--dry-run', action='store_true')
+    parser.add_argument('-c', '--clear', action='store_true')
+    parser.add_argument('-y', '--yes', action='store_true')
+    parser.add_argument('--retry-pending', action='store_true')
+    parser.add_argument('--location', action='append', nargs=2, default=[], metavar=('ADDRESS', 'URI'))
+    interaction = parser.add_mutually_exclusive_group()
+    interaction.add_argument('--interactive', dest='interactive', action='store_true', default=None,
+                             help='offer a per-window folder/URI dialog during save (also without a TTY)')
+    interaction.add_argument('--non-interactive', dest='interactive', action='store_false',
+                             help='save unknown locations as null without prompting')
+    args = parser.parse_args()
+    directory = Path(os.environ.get('DESKTOP_PRESET_DIR', Path(os.environ.get('XDG_CONFIG_HOME', Path.home() / '.config')) / 'desktop_preset'))
+    hypr, runtime, nautilus = Hypr(), Runtime(), Nautilus()
+    if args.action == 'location':
+        # CLI: location set NAME ID URI (kept positional to simplify shell forwarding).
+        if args.name != 'set' or len(args.extra) != 3:
+            raise PresetError('usage: desktop_preset location set NAME INSTANCE_ID URI')
+        name, ident, uri = args.extra
+    else:
+        name = args.name
+    if args.action != 'inspect' and (not name or not re.fullmatch(r'[A-Za-z0-9_-]+', name)):
+        raise PresetError('preset names use letters, digits, hyphens and underscores')
+    path = directory / f'{name}.preset'
+    if args.action == 'validate':
+        if not path.read_text().lstrip().startswith('{'):
+            print('Legacy v1 preset: no per-instance URI coverage; load uses the legacy reader. '
+                  'Arrange windows and save --force to explicitly recapture v2.')
+        else:
+            location_report(validate(read_json(path)))
+        return
+    with runtime.lock():
+        if args.action == 'location':
+            data = validate(read_json(path))
+            old_prefix = runtime.key(path, 0).rsplit(':', 1)[0] + ':'
+            w = next((w for w in data['windows'] if w['id'] == ident and w['class'] == NAUTILUS), None)
+            if not w:
+                raise PresetError('no Nautilus instance with that ID (legacy presets must be recaptured explicitly)')
+            w['uri'] = normalize_uri(uri)
+            w['location_source'] = 'explicit'
+            w['location_confidence'] = 'user-confirmed'
+            backup(path)
+            atomic_json(path, data)
+            new_prefix = runtime.key(path, 0).rsplit(':', 1)[0] + ':'
+            for key, state in list(runtime.data['loads'].items()):
+                if key.startswith(old_prefix):
+                    runtime.data['loads'][new_prefix + key[len(old_prefix):]] = state
+                    entry = state['instances'].get(ident, {})
+                    if entry.get('address'):
+                        runtime.data.setdefault('explicit', {})[entry['address']] = {
+                            'fingerprint': entry.get('fingerprint'), 'uri': w['uri']}
+            runtime.persist()
+            print(f'Location set for {name}/{ident}.')
+            return
+        ws = args.workspace if args.workspace is not None else hypr.query('activeworkspace')['id']
+        if ws <= 0:
+            raise PresetError('workspace must be a positive number')
+        if args.action == 'inspect':
+            bindings, snapshot = capture_locations(hypr, runtime, nautilus)
+            total = known = 0
+            for c in hypr.clients():
+                if c['workspace']['id'] == ws:
+                    binding = bindings.get(c['address'])
+                    uri = explicit_location(runtime, c) if c['class'] == NAUTILUS else None
+                    source = 'explicit' if uri else 'unavailable'
+                    if not uri and binding:
+                        uri = nautilus.location(snapshot, binding)
+                        source = binding.get('method', 'correlated-dbus') if uri else 'multiple-tabs-or-empty'
+                    if c['class'] == NAUTILUS:
+                        total += 1
+                        known += int(bool(uri))
+                    print(json.dumps({'address': c['address'], 'class': c['class'],
+                                      'rect': c['at'] + c['size'], 'uri': uri, 'source': source,
+                                      'tab_count': len(snapshot['windows'].get(binding['object'], [])) if binding else None,
+                                      'load_fallback': 'Home if saved without URI' if c['class'] == NAUTILUS and not uri else None}, ensure_ascii=False))
+            print(f'Nautilus proven/explicit URI coverage: {known}/{total}; unresolved: {total-known}.', file=sys.stderr)
+        elif args.action == 'save':
+            if args.dry_run:
+                print('Would save a v2 snapshot; no preset or windows changed.')
+            else:
+                picker = LocationPicker(hypr, args.interactive)
+                original = hypr.query('activewindow').get('address') if picker.enabled else None
+                try:
+                    save(path, ws, args.force, dict(args.location), hypr, runtime, nautilus, picker)
+                finally:
+                    if original and any(c['address'] == original for c in hypr.clients()):
+                        hypr.focus(original)
+        else:
+            Loader(hypr, runtime, nautilus, float(os.environ.get('DESKTOP_PRESET_TIMEOUT', '20'))).load(
+                path, ws, args.dry_run, args.retry_pending, args.clear, args.yes)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main() or 0)
+    except (PresetError, ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        print(f'error: {exc}', file=sys.stderr)
+        sys.exit(1)

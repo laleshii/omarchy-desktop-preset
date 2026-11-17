@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh - install desktop_preset and its Omarchy menu entry
-set -uo pipefail
+set -euo pipefail
 
 SRC_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 BIN_DIR="${HOME}/.local/bin"
@@ -31,7 +31,7 @@ fi
 
 info "installing scripts to $BIN_DIR"
 mkdir -p "$BIN_DIR"
-for f in desktop_preset desktop-preset-layout desktop-preset-autostart \
+for f in desktop_preset desktop-preset-layout desktop-preset-v2 desktop-preset-autostart \
          desktop-preset-menu-load desktop-preset-menu-save desktop-preset-menu-clear \
          desktop-preset-menu-autostart-enable desktop-preset-menu-autostart-disable desktop-preset-menu-autostart-list; do
   cp "$SRC_DIR/bin/$f" "$BIN_DIR/$f"
@@ -80,7 +80,7 @@ fi
 
 info "wiring up login autostart"
 if [[ -f $AUTOSTART_FILE ]]; then
-  if grep -q 'desktop-preset-autostart' "$AUTOSTART_FILE" 2>/dev/null; then
+  if grep -qE '^[[:space:]]*o\.launch_on_start\("desktop-preset-autostart"\)[[:space:]]*(--.*)?$' "$AUTOSTART_FILE" 2>/dev/null; then
     info "autostart already wired up — leaving $AUTOSTART_FILE untouched"
   else
     printf '\no.launch_on_start("desktop-preset-autostart")\n' >> "$AUTOSTART_FILE"

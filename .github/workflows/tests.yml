@@ -1,0 +1,20 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y jq
+      - run: python3 -m unittest discover -s tests -v
+      - run: |
+          for file in install.sh uninstall.sh bin/*; do
+            if head -1 "$file" | grep -q bash; then bash -n "$file"; fi
+          done
+          python3 -m py_compile bin/desktop-preset-v2 bin/desktop-preset-layout tests/*.py
+          git diff --check
