@@ -13,8 +13,8 @@ desktop_preset autostart set work -w 3
 
 New snapshots use **version 2**: separate IDs for every window, including identical
 classes and titles; a split tree with a ratio at each node; per-window floating
-geometry; argv arrays and optional Nautilus locations. Existing text presets
-still load through the legacy reader, including the cross-workspace fix in
+geometry; argv arrays and optional Nautilus locations. See the [v2 format reference](docs/preset-v2.md) for an editable example.
+Existing text presets still load through the legacy reader, including the cross-workspace fix in
 [PR #1](https://github.com/laleshii/omarchy-desktop-preset/pull/1).
 
 **Nautilus automatic capture is partial.** Arbitrary already-open Wayland windows
