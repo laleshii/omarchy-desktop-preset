@@ -7,8 +7,8 @@ No cold logout/reboot or production-workspace restore was performed.
 
 ## Deterministic suite
 
-`python3 -m unittest discover -s tests -v`: **36 tests pass** (12 retained PR #1
-regressions, 22 v2 tests, 2 installation/helper tests). These use fake apps,
+`python3 -m unittest discover -s tests -v`: **37 tests pass** (12 retained PR #1
+regressions, 23 v2 tests, 2 installation/helper tests). These use fake apps,
 stateful compositors, typed D-Bus snapshots and a disposable HOME. They are not
 live-session evidence. The v2 fake compositor models insertion, removal,
 per-node ratios and gap/border rendering rather than returning requested sizes.
@@ -54,7 +54,32 @@ addresses without adding windows. A real failure during initial testing exposed
 GLib/pathlib differences in escaping `$()`; semantic local-URI comparison fixed
 that case, which then passed the full three-workspace run.
 
-Installed-copy validation is recorded below after deployment.
+The same three-workspace test against the **installed copy** also restored 18
+distinct windows, verified all nine Nautilus URIs, measured 3 px maximum deviation,
+and reused all addresses on second load. Maximum inferred split-fraction change
+was 0.00153 (0.153 percentage points). The geometry comparison uses the same
+monitor/workarea/settings; these numbers are not a changed-monitor guarantee.
+
+Additional installed-copy checks passed:
+
+- Two Nautilus windows with the **same directory** on one workspace, a third
+  different URI, three Ghostty windows including one floating window: six unique
+  addresses, all three URIs verified, maximum rectangle deviation 3 px, and
+  unchanged addresses on second load.
+- Automatic recapture of all three **tracked single-tab** Nautilus locations.
+  This does not prove capture of arbitrary existing windows.
+- Occupied-workspace autostart skipping and unchanged preset bytes.
+- Ordinary Nautilus and Ghostty launches stayed on a different workspace (94)
+  while the restored workspaces remained populated.
+- Missing-folder preflight failed visibly without launching/moving windows;
+  installed dry-run left the client manifest unchanged.
+- All ten installed scripts matched the fork sources byte-for-byte. Existing
+  presets, autostart mappings, menu, autostart Lua and Hyprland rules retained
+  their pre-install hashes. No uninstall/purge was needed.
+
+The retained three-workspace regression against upstream `ebe4ea5` fails with
+two addresses instead of six. The old installed save captured six duplicate-class
+rows without `@anchor`; the v2 snapshot retained all six IDs and its split tree.
 
 ## Capture boundary and untested conditions
 

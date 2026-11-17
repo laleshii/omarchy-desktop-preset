@@ -59,7 +59,7 @@ class InstallTests(unittest.TestCase):
                 dict(id='a',**{'class':'org.gnome.Nautilus'},argv=['nautilus','--new-window'],
                      floating=False,rect=[6,6,988,788],uri=None)])
             path=directory/'test.preset'
-            path.write_text(json.dumps(data))
+            path.write_text('\n  '+json.dumps(data))
             before=path.read_bytes()
             folder=home/"spaces 日本 ;$(touch never)"
             env=dict(os.environ,DESKTOP_PRESET_DIR=str(directory),DESKTOP_PRESET_RUNTIME_DIR=str(home/'runtime'))
@@ -72,6 +72,10 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(updated['windows'][0]['uri'],folder.as_uri())
             self.assertEqual(next(directory.glob('*.bak.*')).read_bytes(),before)
             self.assertFalse((home/'never').exists())
+            result=subprocess.run([str(ROOT/'bin/desktop_preset'),'list'],
+                                  env=env,text=True,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn('a  org.gnome.Nautilus',result.stdout)
 
 
 if __name__=='__main__':

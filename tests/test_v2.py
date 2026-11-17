@@ -430,6 +430,16 @@ class V2Tests(unittest.TestCase):
         after['windows']['/another']=['file:///two']
         self.assertIsNone(self.n.correlated(before,after))
 
+    def test_reuse_refuses_changed_or_unverifiable_tracked_location(self):
+        self.write(preset([window('a',N,self.uri)],{'id':'a'}))
+        self.engine.load(self.path,1)
+        key=next(iter(self.n.windows))
+        for uris in (['file:///changed'],[self.uri,'file:///second-tab']):
+            self.n.windows[key]=uris
+            with self.assertRaisesRegex(v2.PresetError,'location'):
+                self.engine.load(self.path,1)
+        self.assertEqual(len(self.h.launches),1)
+
     def test_validation_rejects_duplicate_ids_invalid_refs_and_injection(self):
         data=self.multi()
         for changed in ('id','ref','ratio','axis','argv'):

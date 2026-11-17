@@ -41,3 +41,9 @@ object establishes a runtime correlation. Read the URI only for single-tab
 windows; multiple tabs require an explicit active-location override. Verify
 launch locations through that mapping when the optional PyGObject API exists.
 This is partial automatic capture, not universal Nautilus session restoration.
+
+Command semantics were checked against the installed 0.56.2 implementation:
+[DwindleAlgorithm.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/layout/algorithm/tiled/dwindle/DwindleAlgorithm.cpp).
+Nautilus window/tab export semantics were checked against
+[nautilus-application.c](https://github.com/GNOME/nautilus/blob/51.1/src/nautilus-application.c)
+and [nautilus-window.c](https://github.com/GNOME/nautilus/blob/51.1/src/nautilus-window.c).

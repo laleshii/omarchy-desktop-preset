@@ -317,6 +317,7 @@ guess_launch_command() {
 
 preset_file() { printf '%s/%s.preset\n' "$DIR" "$1"; }
 autostart_file() { printf '%s/autostart.conf\n' "$DIR"; }
+is_v2() { [[ $(LC_ALL=C awk 'NF {sub(/^[[:space:]]*/, ""); print substr($0,1,1); exit}' "$1") == '{' ]]; }
 
 # The actual dwindle split tree, reconstructed purely from each window's
 # saved position/size (see desktop-preset-layout for the algorithm and why
@@ -364,7 +365,7 @@ cmd_list() {
     found=1; n=$(basename "$f" .preset)
     if (( NAMES_ONLY )); then printf '%s\n' "$n"; continue; fi
     printf '\033[1m%s\033[0m\n' "$n"
-    if [[ $(head -c1 "$f") == '{' ]]; then
+    if is_v2 "$f"; then
       jq -r '.windows[] | "    \(.id)  \(.class)  location=\(.location_source // "n/a")"' "$f"
       printf '\n'
       continue
@@ -540,7 +541,7 @@ cmd_load() {
   ws=${WS:-$(cur_ws)}
   [[ $ws =~ ^[0-9]+$ ]] || die "workspace must be a number: $ws"
 
-  if [[ $(head -c1 "$f") == '{' ]]; then
+  if is_v2 "$f"; then
     local -a args=(load "$name" -w "$ws")
     (( DRY )) && args+=(--dry-run)
     (( CLEAR )) && args+=(--clear)

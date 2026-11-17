@@ -436,8 +436,14 @@ class Loader:
                     raise PresetError('journal assigns one address to multiple instances')
                 if w['class'] == NAUTILUS and w.get('uri'):
                     actual = self.uri(c, snapshot)
+                    if self.rt.binding(c) and actual is None:
+                        raise PresetError(f'{w["id"]}: tracked Nautilus active location cannot be verified '
+                                          '(multiple tabs or changed D-Bus state); refusing an uncertain reuse')
                     if actual is not None and not uri_equal(actual, w['uri']):
                         raise PresetError(f'{w["id"]}: tracked Nautilus location changed; refusing to swap folders')
+                    if actual is None:
+                        warn(f'{w["id"]}: reusing the explicit saved address association; '
+                             'the current Nautilus location cannot be verified for this untracked window')
                 selected[w['id']] = c
                 consumed.add(c['address'])
             else:
