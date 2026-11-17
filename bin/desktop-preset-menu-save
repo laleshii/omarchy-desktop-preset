@@ -17,7 +17,7 @@ if [[ -e ${XDG_CONFIG_HOME:-$HOME/.config}/desktop_preset/$name.preset ]]; then
   extra_args+=(--force)
 fi
 
-out=$(desktop_preset save "$name" "${extra_args[@]}" 2>&1)
+out=$(desktop_preset save "$name" --interactive "${extra_args[@]}" 2>&1)
 rc=$?
 
 if (( rc == 0 )); then
@@ -25,7 +25,7 @@ if (( rc == 0 )); then
   n=$(jq '.windows | length' <<< "$data")
   missing=$(jq '[.windows[] | select(.class == "org.gnome.Nautilus" and .uri == null)] | length' <<< "$data")
   if (( missing )); then
-    omarchy notification send "Saved '$name' with missing locations" "$missing Nautilus URI(s) need explicit per-instance overrides; see desktop_preset show $name" -g "" -u critical
+    omarchy notification send "Saved '$name' with missing locations" "$missing Nautilus instance(s) will open Home; recapture with save --force --interactive" -g "" -u critical
   else
     omarchy notification send "Saved '$name'" "$n window(s) from this workspace" -g "󰆓"
   fi

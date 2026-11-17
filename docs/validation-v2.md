@@ -1,93 +1,95 @@
 # Validation evidence
 
-Status: **PARTIAL** for automatic Nautilus capture. Explicit per-instance URI
-round-trip and duplicate-window Dwindle restoration were validated separately
-from automatic capture of arbitrary already-open windows, which is unavailable.
-No cold logout/reboot or production-workspace restore was performed.
+Automatic Nautilus capture is **partial**: exact runtime bindings and complete
+stable singletons can supply URIs. Arbitrary indistinguishable pre-existing
+windows require independent explicit selection. No title/PID/list-order matching
+is claimed. The user confirmed cold-login failures before this fix. A real
+post-fix reboot/logout has **not** been performed.
 
 ## Deterministic suite
 
-`python3 -m unittest discover -s tests -v`: **37 tests pass** (12 retained PR #1
-regressions, 23 v2 tests, 2 installation/helper tests). These use fake apps,
-stateful compositors, typed D-Bus snapshots and a disposable HOME. They are not
-live-session evidence. The v2 fake compositor models insertion, removal,
-per-node ratios and gap/border rendering rather than returning requested sizes.
+`python3 -m unittest discover -s tests -v`: **78 tests pass**. All 37 earlier
+scenarios are retained; the old fatal-null/missing-directory expectations now
+explicitly require successful Home fallback. The suite uses stateful fake
+compositors/apps and disposable HOME/runtime directories, not a live compositor.
 
-Coverage includes five mixed duplicate windows on three workspaces, equal titles,
-three distinct URIs, repeated identical URIs, nested non-equal ratios, inference
-up to 10 leaves, exact ID allocation, new-address exclusion, old-title changes,
-slow launch, timeout/retry fencing, foreign-workspace protection, float geometry,
-geometry failure, missing URI/directory, dry-run, idempotence, correlated versus
-untracked capture, multi-tab refusal, URI escaping, schema validation, backups,
-location overrides and preservation of unrelated installation customizations.
+Coverage includes nested ratios up to ten leaves, 10 mixed windows on each of
+three workspaces, identical titles and folders, per-ID URI association, exact
+address exclusion/reuse, foreign-workspace protection, floating geometry,
+geometry failures, pending timeout/retry fences, idempotence, URI null/invalid/
+inaccessible fallback, preserved preset bytes, dynamic Home, remote probe
+statuses/timeouts and argv escaping. Discovery tests exercise typed property
+shape/signature, owner/PID changes, initial bootstrap, stable inventories,
+singleton versus ambiguous multi-window capture, duplicate runtime bindings,
+multiple tabs, explicit precedence, stable-ID address reuse and unavailable
+PyGObject. GUI/CLI adapters cover local/remote choice, cancellation, invalid
+input, no TTY/display and timeouts. Installation/helper tests cover atomic
+failure cleanup, backups, legacy/v2 validation, autostart exit propagation and
+preservation of unrelated customization.
 
-Bash syntax, Python AST/compilation and `git diff --check` pass. ShellCheck and
-Pyflakes are unavailable; no global dependencies were installed to run checks.
+Bash syntax, Python compilation, `git diff --check`, ShellCheck at error severity,
+and Ruff `F,E9` pass. ShellCheck at warning severity reports the pre-existing
+SC2206 in the legacy desktop-entry token parser; it is outside the new URI path. Lint tools ran through isolated `uvx` environments; no
+runtime dependency was installed. A compositor-free GitHub Actions workflow runs
+the unit, syntax and compile checks. Hosted CI status is separate from local PASS.
 
-## Live host
+## Current live verification
 
-Omarchy 4.5.0-3 / Hyprland 0.56.2 / Nautilus 51.1, Wayland, Dwindle, one monitor,
-2560×1080 at scale 1, workarea reduced by a 30 px top reservation. Only confirmed
-empty disposable workspaces 91–94 and private temporary test directories were
-used. All original window addresses and workspace assignments were checked after
-cleanup; application/VPN settings were not changed.
+Omarchy 4.5.0-3 / Hyprland 0.56.2 / Nautilus 51.1, GTK 4.24.1, Wayland/Dwindle.
+Tests use two verified unused temporary workspaces and private synthetic folders.
+Only test-created addresses are closed. Existing window/workspace assignments
+are compared after cleanup. Private inventories, preset JSON and logs stay
+outside the repository; only aggregate measurements are recorded here.
 
-The initial six-window workspace contained three Nautilus and three Ghostty
-windows. Two Nautilus directories had identical basenames/titles; a third used
-Unicode, spaces and shell punctuation. Sequential new-address/new-GTK-object
-correlation verified each actual folder before save. Explicit save overrides
-attached those known URIs to their corresponding window geometry. The legacy
-installed save reproduced the missing-tree fallback for duplicate classes.
+The checkout smoke test passed these cases:
 
-A nested layout with both split directions and ratios 0.39, 0.58, 0.55, 0.43 and
-0.63 was arranged, saved, and only its test windows closed. The checkout CLI then
-restored the preset on each of 91–93:
+| Case | Windows | URI result | Geometry / repeat |
+|---|---:|---|---|
+| Existing windows opened outside the loader | 4 Nautilus + 2 Ghostty | Four independent scripted CLI prompts; no ambiguous automatic assignment | One floating terminal retained |
+| Save, close test windows, load | 6 | 4/4 Nautilus URIs verified, including two equal folders and two equal basenames with distinct URIs | Maximum rectangle delta 3 logical px; repeated load retains all addresses |
+| Automatic recapture after proven loader correlation | 6 | 4/4 single-tab Nautilus URIs captured without overrides/input | IDs and per-window geometry retained |
+| Synthetic historical v2 with all Nautilus URIs null, two workspaces | 12 total | 8/8 separate Nautilus windows verified at dynamic Home; exit 0, warning | Maximum delta 3 px; idempotent; preset bytes unchanged |
+| Missing local directory | 6 | Missing instance verified at Home, other three Nautilus URIs retained; exit 0 | Maximum delta 3 px; floating state retained |
 
-| Workspace | Windows | Nautilus URIs verified | Max rectangle deviation |
-|---|---:|---:|---:|
-| 91 | 6 | 3/3 | 3 logical px |
-| 92 | 6 | 3/3 | 3 logical px |
-| 93 | 6 | 3/3 | 3 logical px |
+Maximum inferred per-node split-fraction drift was 0.003096. Geometry uses the
+same monitor/workarea/settings; this is not a changed-monitor guarantee.
+The interactive test drives the actual CLI adapter through a pseudo-TTY with
+synthetic answers. It is not a claim that a person tested the graphical dialogs.
+The chooser implementation is separately unit tested. Original user windows were
+preserved and no test windows remained after cleanup.
 
-All 18 addresses were distinct. A second load per workspace reused the exact
-addresses without adding windows. A real failure during initial testing exposed
-GLib/pathlib differences in escaping `$()`; semantic local-URI comparison fixed
-that case, which then passed the full three-workspace run.
+Repeated installed-copy runs passed the same cases with 2–3 px maximum delta
+(final run: 2 px and split-fraction drift 0.001562), then exercised **unattended `autostart run` with stdin=DEVNULL**: twelve windows
+on two temporary workspaces, including eight distinct Nautilus Home instances,
+exit 0, and repeated autostart skipping the occupied workspaces. Only a private
+synthetic preset/autostart directory was used. The actual login-hook wrapper
+also restored all twelve windows with stdin=DEVNULL, exit 0 and a nonblocking
+diagnostic. No production mappings were run.
 
-The same three-workspace test against the **installed copy** also restored 18
-distinct windows, verified all nine Nautilus URIs, measured 3 px maximum deviation,
-and reused all addresses on second load. Maximum inferred split-fraction change
-was 0.00153 (0.153 percentage points). The geometry comparison uses the same
-monitor/workarea/settings; these numbers are not a changed-monitor guarantee.
+`./install.sh` ran from the existing fork checkout. All ten installed executables
+matched source SHA-256. Existing preset, autostart, menu and Hyprland configuration
+hashes were unchanged; exactly one login hook remained. The ordinary installed
+CLI was checked without rewriting any user preset. Backup and rollback scripts
+are private, outside tracked Git.
 
-Additional installed-copy checks passed:
+## Earlier branch evidence
 
-- Two Nautilus windows with the **same directory** on one workspace, a third
-  different URI, three Ghostty windows including one floating window: six unique
-  addresses, all three URIs verified, maximum rectangle deviation 3 px, and
-  unchanged addresses on second load.
-- Automatic recapture of all three **tracked single-tab** Nautilus locations.
-  This does not prove capture of arbitrary existing windows.
-- Occupied-workspace autostart skipping and unchanged preset bytes.
-- Ordinary Nautilus and Ghostty launches stayed on a different workspace (94)
-  while the restored workspaces remained populated.
-- Missing-folder preflight failed visibly without launching/moving windows;
-  installed dry-run left the client manifest unchanged.
-- All ten installed scripts matched the fork sources byte-for-byte. Existing
-  presets, autostart mappings, menu, autostart Lua and Hyprland rules retained
-  their pre-install hashes. No uninstall/purge was needed.
+Before the safe-fallback change, the branch had 37 passing mock/disposable-HOME
+tests and an installed live run with three Nautilus plus three Ghostty on each
+of three temporary workspaces: 18 distinct addresses, nine displayed URIs,
+maximum rectangle deviation 3 px, ratio drift 0.00153, and idempotent reload.
+Initial saves used explicit URI overrides. Another six-window case included
+two equal directories and a floating terminal. That evidence verified the
+Dwindle/per-instance algorithm, **not** successful restoration of null URI at
+cold login. Its fatal missing-directory policy is superseded by this change.
 
-The retained three-workspace regression against upstream `ebe4ea5` fails with
-two addresses instead of six. The old installed save captured six duplicate-class
-rows without `@anchor`; the v2 snapshot retained all six IDs and its split tree.
+## Limits / not run
 
-## Capture boundary and untested conditions
-
-Nautilus `OpenWindowsWithLocations` is indexed by GTK object path, not compositor
-address. GTK4 AT-SPI reported `(0,0)` window origins; duplicate sizes/titles do not
-prove correlation. Arbitrary existing windows therefore need explicit overrides.
-No claim of universal automatic capture, active-tab detection, or private-tree
-introspection is made. Exact hidden topology is indeterminate when several trees
-produce identical rectangles. Remote/GVfs locations, changed monitor settings,
-first-ever Nautilus bootstrap, ten-window live layouts, and min/max-constrained
-apps were not live tested. Min/max geometry failures are covered by mocks.
+A real post-fix reboot/logout, singleton capture isolated from existing user
+windows, actual GUI clicks, remote/GVfs restoration, first-ever Nautilus process
+bootstrap, changed monitor settings, ten-window live layouts and constrained
+apps were not live tested. Their automated coverage, where present, is not live
+evidence. Multi-tab active URI is not inferred. Rectangles can describe more
+than one geometrically equivalent hidden tree; the inferred tree is compatible,
+not Hyprland private-tree introspection. Application constraints may prevent the
+8 px geometry tolerance and remain visible failures.

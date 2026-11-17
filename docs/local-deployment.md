@@ -23,9 +23,11 @@ git pull --ff-only origin <patched-branch>
 ```
 
 Old presets remain legacy captures until explicitly resaved. After arranging an
-actual workspace, use `desktop_preset inspect` and `save NAME --force --location
-ADDRESS URI` for every untracked Nautilus window. This creates a backup and v2
-snapshot without changing existing `autostart.conf` mappings.
+actual workspace, use `desktop_preset save NAME --force --interactive` for
+per-window selection, or supply `--location ADDRESS URI` for scripted overrides.
+`desktop_preset validate NAME` reports missing locations and expected fallback.
+Explicit recapture creates a backup and v2 snapshot without changing existing
+`autostart.conf` mappings.
 
 To remove the tool while preserving presets, run `./uninstall.sh` **without
 `--purge`**. To restore a prior installation from a backup, copy its project
@@ -35,4 +37,4 @@ Restore `~/.config/desktop_preset/` only if it actually changed and recovery is
 needed; an ordinary install does not change it. Remove the new
 `desktop-preset-v2` executable when rolling back to a version without that helper.
 After restoring a changed Hyprland Lua file, run `hyprctl reload` and
-`hyprctl configerrors`. No logout, reboot or VPN restart is necessary.
+`hyprctl configerrors`. No logout or reboot is necessary.

@@ -13,7 +13,7 @@ set -uo pipefail
 # Keep the legacy reader intact; new snapshots use a typed instance schema.
 V2="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/desktop-preset-v2"
 case ${1:-} in
-  save|location|inspect) exec python3 "$V2" "$@" ;;
+  save|location|inspect|validate) exec python3 "$V2" "$@" ;;
 esac
 
 DIR="${DESKTOP_PRESET_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/desktop_preset}"
@@ -43,6 +43,7 @@ usage:
   desktop_preset clear [options]          close windows on a workspace
   desktop_preset edit <name>              open a preset in $EDITOR
   desktop_preset inspect [-w N]          show instance addresses and known URIs
+  desktop_preset validate NAME           report URI coverage and Home fallback
   desktop_preset location set NAME ID URI  set a v2 Nautilus instance location
   desktop_preset autostart list [--raw]   show which workspace loads what at login
   desktop_preset autostart set <name> -w N    auto-load <name> on workspace N at login
@@ -62,6 +63,8 @@ load-only options:
 save-only options:
   -f, --force               overwrite an existing preset of the same name
       --location ADDRESS URI  explicitly capture this Nautilus window's URI
+      --interactive           offer a folder/URI dialog for each unknown window
+      --non-interactive       keep unknown URI null; load uses Home
 
 v2 load recovery:
       --retry-pending       explicitly retry a timed-out launch after inspection
@@ -94,8 +97,9 @@ presets live in ~/.config/desktop_preset/<name>.preset
 New saves use version 2 JSON: distinct instance IDs, argv arrays, per-node
 split ratios and per-window locations. Legacy text files remain readable.
 save --force backs up and recaptures the current workspace; it does not
-recover locations or geometry absent from an old file. Untracked Nautilus
-locations require explicit overrides. See README.md for capture limitations.
+recover locations or geometry absent from an old file. Save uses explicit
+locations, proven D-Bus capture, then per-window interactive selection.
+Unknown/unavailable Nautilus locations use Home on load without login prompts.
 USAGE
 }
 

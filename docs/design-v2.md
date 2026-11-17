@@ -32,15 +32,35 @@ an aligned 2x2 grid); infer a deterministic guillotine tree, without claiming
 access to Hyprland's private internal tree.
 
 Nautilus 51.1 exports `OpenWindowsWithLocations`, keyed by GTK object paths.
-Hyprland does not expose those paths, and GTK4 AT-SPI reports (0,0) origins on
-this Wayland host. Neither titles, process argv nor list order proves a mapping.
-For existing untracked windows, save a null URI plus a visible warning; support
-explicit address-to-URI overrides at save and ID-to-URI editing afterward.
-For our own sequential launches, one new Hyprland address plus one new GTK
-object establishes a runtime correlation. Read the URI only for single-tab
-windows; multiple tabs require an explicit active-location override. Verify
-launch locations through that mapping when the optional PyGObject API exists.
-This is partial automatic capture, not universal Nautilus session restoration.
+Read its typed `a{sas}` GVariant using optional PyGObject with finite call timeouts.
+Validate the FileManager1 and Nautilus owners, owner PID, property shape, and
+stable owner/inventories. Auto-capture only an existing exact session binding or
+a complete singleton across all workspaces with matching owner PID. Do not use
+list order, title, basename, process argv/cwd, size, or AT-SPI `(0,0)` origins to
+associate objects. Multiple addresses for one object invalidate those bindings.
+For sequential launches, one new address and one new GTK object establish a
+session correlation; an existing owner changing invalidates it. Cold bootstrap
+is accepted only after a positive D-Bus NameHasNoOwner response; a failed or
+delayed snapshot is not proof of an empty inventory.
+
+Prioritize explicit live-window overrides, then proven single-tab capture,
+then a save-only interactive selection adapter. Focus only the specified window,
+show ID/workspace/address, support local folder and text URI selection, and
+restore the original focus. Cancel/no TTY/noninteractive save may retain null.
+Multiple tabs require an explicit target; exported lists and action indices do
+not guarantee the active URI. Persist explanatory provenance, never runtime
+identifiers in a preset. See [mechanism research](nautilus-locations.md).
+
+Load resolves every Nautilus location independently. Missing/invalid/inaccessible
+local folders use dynamic Home; remote probes run without mount/authentication
+in a child bounded to 2.5 seconds, with unavailable/unverified results using
+Home. Keep the original preset bytes. Launch a separate `--new-window` per ID,
+then replay the unchanged tree. A displayed-location mismatch may call `go-home`
+only on the proven new GTK object, never on a guessed user window. Unavailable
+D-Bus verification produces a warning instead of aborting the layout. Record
+runtime Home fallback for idempotent reload and emit a nonblocking notification.
+Other launch/layout errors retain nonzero status. Neither load nor login creates
+an interactive selection adapter. No rules, daemon or persistent policy changes.
 
 Command semantics were checked against the installed 0.56.2 implementation:
 [DwindleAlgorithm.cpp](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/layout/algorithm/tiled/dwindle/DwindleAlgorithm.cpp).

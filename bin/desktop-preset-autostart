@@ -8,6 +8,10 @@ set -uo pipefail
 out=$(desktop_preset autostart run 2>&1)
 rc=$?
 
+if [[ $out == *'Home fallback:'* ]]; then
+  printf 'warning: Desktop preset used Nautilus Home fallback; run desktop_preset validate NAME for details.\n' >&2
+fi
 if (( rc != 0 )); then
   omarchy notification send "Desktop preset autostart failed" "$(tail -n1 <<< "$out")" -g "" -u critical
 fi
+exit "$rc"

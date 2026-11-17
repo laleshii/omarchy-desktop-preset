@@ -2,11 +2,9 @@
 import copy
 import importlib.machinery
 import importlib.util
-import json
 import os
 from pathlib import Path
 import re
-import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -73,6 +71,9 @@ class FakeNautilus:
 
     def snapshot(self):
         return copy.deepcopy(dict(owner=self.owner, windows=self.windows))
+
+    def go_home(self, binding):
+        self.windows[binding['object']] = [Path.home().as_uri()]
 
 
 class FakeHypr:
@@ -211,6 +212,11 @@ class V2Tests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        home = self.root/'home'
+        home.mkdir()
+        environment = patch.dict(os.environ, HOME=str(home))
+        environment.start()
+        self.addCleanup(environment.stop)
         self.rt = v2.Runtime(self.root / 'runtime')
         self.n = FakeNautilus()
         self.h = FakeHypr(self.n)
@@ -221,6 +227,9 @@ class V2Tests(unittest.TestCase):
         self.patch = patch.object(v2.subprocess, 'Popen', self.h.popen)
         self.patch.start()
         self.addCleanup(self.patch.stop)
+        notification = patch.object(v2, 'notify_fallback')
+        notification.start()
+        self.addCleanup(notification.stop)
         self.uri = self.root.as_uri()
 
     def write(self, data):
@@ -323,18 +332,24 @@ class V2Tests(unittest.TestCase):
         self.assertEqual(old['workspace']['id'], 9)
         self.assertEqual(len(self.h.clients()), 2)
 
-    def test_missing_uri_is_visible_and_preflight_has_no_mutations(self):
+    def test_missing_uri_restores_home_and_other_windows_with_warning(self):
         self.write(preset([window('a'), window('b', N)], node('x', .5, 'a', 'b')))
-        with self.assertRaisesRegex(v2.PresetError, 'URI unavailable'):
+        original = self.path.read_bytes()
+        with patch.object(v2, 'warn') as warning:
             self.engine.load(self.path, 1)
-        self.assertEqual(self.h.launches, [])
-        self.assertEqual(self.h.dispatches, [])
+        self.assertEqual(len(self.h.clients()), 2)
+        self.assertIn((['nautilus', '--new-window', Path.home().as_uri()], None), self.h.launches)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertTrue(warning.called)
+        self.engine.load(self.path, 1)
+        self.assertEqual(len(self.h.launches), 2)
 
-    def test_unavailable_folder_does_not_fallback_home(self):
+    def test_unavailable_folder_falls_back_home_without_rewriting_preset(self):
         self.write(preset([window('a', N, (self.root/'missing').as_uri())], {'id':'a'}))
-        with self.assertRaisesRegex(v2.PresetError, 'missing or inaccessible'):
-            self.engine.load(self.path, 1)
-        self.assertEqual(self.h.launches, [])
+        original = self.path.read_bytes()
+        self.engine.load(self.path, 1)
+        self.assertEqual(self.h.launches[0][0][-1], Path.home().as_uri())
+        self.assertEqual(self.path.read_bytes(), original)
 
     def test_dry_run_has_no_launch_move_or_journal_write(self):
         self.multi()
@@ -369,7 +384,7 @@ class V2Tests(unittest.TestCase):
         self.assertTrue(clients[1]['floating'])
         self.assertEqual(clients[1]['at'] + clients[1]['size'], [30,40,300,250])
 
-    def test_wrong_uri_does_not_get_reported_as_restored(self):
+    def test_wrong_displayed_uri_navigates_only_proven_new_window_home(self):
         self.write(preset([window('a', N, self.uri)], {'id':'a'}))
         original = self.h.popen
         def wrong(argv, **kwargs):
@@ -378,8 +393,10 @@ class V2Tests(unittest.TestCase):
                 self.n.windows[k] = ['file:///wrong']
             return result
         with patch.object(v2.subprocess, 'Popen', wrong):
-            with self.assertRaisesRegex(v2.PresetError, 'verified Nautilus URI'):
-                self.engine.load(self.path, 1)
+            self.engine.load(self.path, 1)
+        self.assertEqual(self.engine.uri(self.h.clients()[0], self.n.snapshot()), Path.home().as_uri())
+        self.assertEqual(len(self.h.launches), 1)
+        self.assertIn('a', self.engine.fallbacks)
 
     def test_journal_does_not_reclaim_window_moved_to_other_workspace(self):
         self.write(preset([window('a')], {'id':'a'}))
@@ -425,7 +442,7 @@ class V2Tests(unittest.TestCase):
     def test_dbus_owner_change_and_multiple_new_objects_are_not_guessed(self):
         before=dict(owner='one',windows={'/old':['file:///one']})
         after=dict(owner='two',windows={'/old':['file:///new']})
-        self.assertEqual(self.n.correlated(before,after),'/old')
+        self.assertIsNone(self.n.correlated(before,after))
         self.assertIsNone(self.n.location(after,dict(owner='one',object='/old')))
         after['windows']['/another']=['file:///two']
         self.assertIsNone(self.n.correlated(before,after))

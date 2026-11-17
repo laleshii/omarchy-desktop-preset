@@ -17,18 +17,20 @@ geometry; argv arrays and optional Nautilus locations. See the [v2 format refere
 Existing text presets still load through the legacy reader, including the cross-workspace fix in
 [PR #1](https://github.com/laleshii/omarchy-desktop-preset/pull/1).
 
-**Nautilus automatic capture is partial.** Arbitrary already-open Wayland windows
-cannot currently be correlated reliably with Nautilus's GTK D-Bus window IDs.
-Use explicit per-window locations when saving those windows. Missing locations
-are saved as `null`, warned about (including from the Save menu), and refused on
-cold load. The tool never guesses a folder from a title, process cwd, or argv.
-See [Nautilus locations](#nautilus-locations).
+**Nautilus capture is conservative.** Save prefers explicit locations, proven
+D-Bus capture, then a separate interactive choice for each unresolved window.
+Unknown locations remain `null` with a warning. Load opens an independent Home
+window for every missing/invalid/unavailable Nautilus location and continues the
+whole layout, including at login. No folder is guessed from a title or process
+cwd. See [Nautilus locations](#nautilus-locations).
 
 ## Install and update
 
 Requirements: Omarchy 4+, Hyprland 0.56+ with Lua dispatches, Bash, jq, Python 3.
 Optional **PyGObject** (`python-gobject` on Arch) enables typed Nautilus D-Bus
-correlation and displayed-location verification. No Python packages are installed
+correlation, displayed-location verification and bounded remote availability checks.
+Optional zenity/yad provide folder dialogs; the existing Omarchy input menu or a
+TTY supplies a path/URI prompt. No GUI packages are required or installed. No Python packages are installed
 by this project. Tested on Omarchy 4.5.0-3, Hyprland 0.56.2 and Nautilus 51.1.
 
 Run the installer **from your chosen checkout**:
@@ -66,7 +68,9 @@ desktop_preset show work
 desktop_preset edit work                   # $EDITOR, default nano
 desktop_preset inspect [-w 3]              # live addresses and verified known URIs
 desktop_preset save work [-w 3]
-desktop_preset save work --force           # backup, then explicit recapture
+desktop_preset save work --force --interactive # backup, then per-window recapture
+desktop_preset save work --non-interactive  # never prompt; unknown URI stays null
+desktop_preset validate work               # URI coverage and current fallback policy
 desktop_preset load work [-w 3]
 desktop_preset load work --dry-run
 desktop_preset clear [-w 3]                # asks before closing windows
@@ -85,59 +89,86 @@ apps can launch or the geometry can be realized.
 
 ## Nautilus locations
 
-First inspect the workspace's individual addresses, then supply the actual
-active folder for each window explicitly:
+Saving follows this order for **each window independently**:
+
+1. `--location ADDRESS URI`, or a fingerprint-checked explicit session assignment.
+2. Proven `OpenWindowsWithLocations` capture: an existing exact runtime binding,
+   or a stable complete singleton inventory with matching D-Bus owner/PID.
+3. An interactive folder/URI choice, with the exact window focused and its ID,
+   workspace and address displayed. Multiple tabs require a choice; no first-tab
+   assumption is made. Known tab candidates are offered only for a proven binding.
+4. Cancel, no TTY, or `--non-interactive`: save `null` and warn. Load uses Home.
+
+The Save menu explicitly enables interaction. Terminal saves prompt when stdin
+is a TTY; `--interactive` also allows an available graphical dialog without one.
+Without a display and TTY, even `--interactive` keeps unknown locations as null.
+Zenity/yad offer a local folder picker or text URI entry. Omarchy's existing
+input menu accepts either a path or remote URI. No dialog is used by load or login.
+
+```sh
+desktop_preset save files -w 3 --interactive
+desktop_preset validate files
+# Reopen the desired folders, then explicitly replace the capture with a backup:
+desktop_preset save files -w 3 --force --interactive
+```
+
+For a scripted override, use current addresses from `inspect`:
 
 ```sh
 desktop_preset inspect -w 3
 desktop_preset save files -w 3 \
-  --location 0x123 '/absolute/path/with spaces' \
-  --location 0x456 'file:///absolute/path/Unicode%20folder' \
-  --location 0x789 '/another/folder'
-```
-
-The addresses above are examples: use current addresses from `inspect`. Each
-saved row has an independent `w1`, `w2`, … ID, even for the same directory twice.
-Addresses are never stored as reboot-persistent identities in the preset.
-Alternatively, set a location **by saved ID** after inspecting `show`:
-
-```sh
-desktop_preset location set files w1 '/absolute/path/with spaces'
+  --location 0x123 '/tmp/example/one' \
+  --location 0x456 'file:///tmp/example/two'
+desktop_preset location set files w1 '/tmp/example/one'
 desktop_preset location set files w3 'sftp://server.example/share/folder'
 ```
 
-This helper backs up the preset, updates only that instance's location, and
-preserves the tree and IDs. Paths are normalized to URIs; URIs and argv are JSON
-data, passed directly to `subprocess.Popen`, without shell interpolation. Quote
-arguments in your shell. Whitespace, Unicode, percent encoding and punctuation
-are supported. Each launch uses `nautilus --new-window URI`, including repeated
-identical URIs. Home is represented by an explicit home URI, never by `null`.
+Every saved instance keeps an independent ID, even for the same folder twice.
+`location set` backs up and atomically replaces one URI while retaining IDs and
+the tree. Explicit assignments take precedence over automatic capture and are
+remembered for that live window's lifetime in the private session journal.
+New overrides replace them. A later session must recapture its own locations.
 
-With PyGObject and `OpenWindowsWithLocations`, a sequential launch correlates
-**one new Hyprland address** with **one new Nautilus GTK object**. It waits for
-that object's displayed URI to match the requested URI before assigning the
-window to its slot. This correlation is session-local and invalidated by a D-Bus
-owner or process change. Subsequent saves of these tracked **single-tab** windows
-can capture their current URI automatically. Closing the tool does not require
-a watcher; a private runtime journal records the correlation.
+The [Nautilus extension](https://sources.debian.org/src/nautilus/51.0.1-3/data/freedesktop-dbus-interfaces.xml)
+exports a typed `a{sas}` mapping of GTK object paths to **all tab URIs**. Its
+`OpenLocations` aggregate cannot associate windows. Hyprland addresses and GTK
+IDs occupy different namespaces. AT-SPI on the tested GTK4/Wayland host reports
+window origins `(0,0)` and buildable IDs, not the GTK application-window IDs.
+Foreign-toplevel mappings identify the compositor side only. Title/basename,
+PID alone, size, list order and tab order are never used to guess a binding.
+See the [mechanism comparison and capture boundaries](docs/nautilus-locations.md).
 
-This does **not** provide automatic capture of arbitrary pre-existing windows.
-The installed [Nautilus API](https://github.com/GNOME/nautilus/blob/51.1/src/nautilus-application.c)
-exports GTK object paths and tab locations, without a Hyprland address. GTK4
-AT-SPI on the tested Wayland host reports window origins `(0,0)`; equal sizes or
-titles do not establish identity. The tool deliberately avoids such guesses.
-Multi-tab windows require an explicit active-location override: the API's tab
-list does not establish the active URI. Tab history and inactive tabs are not
-restored.
+A complete stable singleton can be captured even if opened outside the loader.
+This case is unit tested; it could not be isolated live without closing existing
+user windows. Several arbitrary pre-existing windows remain ambiguous on this
+host and receive independent manual choices. Sequential loader launches correlate
+one new address with one new GTK object, verify the URI, and journal that binding.
+A D-Bus owner/process change, duplicate object assignment, incomplete inventory or
+window churn disables capture. No daemon is needed. Multiple tabs are not restored;
+select one target URI for that instance. `location_source` and
+`location_confidence` record provenance without persisting compositor addresses.
 
-Local folders must exist and be accessible before loading; missing disks or
-folders cause a visible failure, without a home-directory fallback. Remote/GVfs
-URIs may be specified explicitly and are passed unchanged as data. Credentials,
-mounts and network access must already work; a slow/inaccessible location times
-out instead of being marked restored. Remote capture/restore has **not** been
-live validated. Without PyGObject, launches can pass a supplied URI but report
-that the displayed location is unverified. With a working D-Bus API, missing or
-mismatched location verification fails the load.
+Each new Nautilus instance uses direct argv `nautilus --new-window URI`, including
+repeated identical folders. Whitespace, Unicode, percent encoding and shell
+punctuation are data; no `eval` or shell launch is used. Quote shell arguments.
+A historical `null` contains no recoverable folder address. The loader computes
+the current user's Home dynamically; it never rewrites that historical file.
+
+Missing/invalid local locations, non-directory paths and inaccessible directories
+fall back to Home before launch. Remote/GVfs paths are queried without mounting
+or authentication UI in an optional PyGObject child with a 2.5 second timeout.
+Unavailable, timed-out or unverified remote resources also use Home; accessible
+mounted resources retain their URI. No credentials are requested at login. A
+late displayed-URI mismatch navigates only the proven newly created GTK window
+Home. If D-Bus verification itself is unavailable, the argv request is reported
+as unverified, and tree replay continues. A session Home fallback is remembered
+for idempotent reload. Warnings and a nonblocking desktop notification identify
+fallbacks; `validate NAME` reports current coverage and load targets.
+
+Failures to start an application, an unresolved new-window timeout, ambiguous
+occupied workspaces and geometry errors still return nonzero. Remote/GVfs and
+real post-fix reboot were not live tested. Existing v1 files retain their legacy
+reader; v2 files keep the same schema, names and autostart bindings.
 
 ## Identity, reuse and failure recovery
 
@@ -192,7 +223,7 @@ six-window nested test measured **3 px maximum**. Changed resolutions use the
 saved normalized cuts; floating rectangles scale and stay inside the workarea.
 Changed gaps, scale, borders or app min/max sizes can prevent the 8 px criterion;
 the loader reports a geometry failure rather than claiming exact restoration.
-It does not relax application constraints (including AmneziaVPN constraints).
+It does not relax application constraints.
 
 Rectangles cannot reveal a unique hidden compositor tree for geometrically
 equivalent arrangements, such as a perfectly aligned 2×2 grid. In that case the
@@ -244,5 +275,5 @@ git diff --check
 
 Tests use stateful fake apps/compositors and a disposable HOME; see
 [validation evidence](docs/validation-v2.md) for the separate live-host results.
-ShellCheck was unavailable on the validation host. Design decisions are in
+ShellCheck and Ruff checks are also recorded there. Design decisions are in
 [design-v2.md](docs/design-v2.md). MIT license: [LICENSE](LICENSE).

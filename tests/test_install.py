@@ -10,6 +10,39 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstallTests(unittest.TestCase):
+    def test_validate_missing_uri_is_successful_and_legacy_stays_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            env = dict(os.environ, DESKTOP_PRESET_DIR=tmp,
+                       DESKTOP_PRESET_RUNTIME_DIR=str(directory/'runtime'))
+            path = directory/'example.preset'
+            for text in ('example | example\n', json.dumps(dict(version=2, workarea=[0,0,1000,800],
+                    windows=[dict(id='a', **{'class': 'org.gnome.Nautilus'}, floating=False,
+                                  rect=[6,6,988,788], uri=None)], tree={'id':'a'}))):
+                path.write_text(text)
+                result = subprocess.run([str(ROOT/'bin/desktop_preset'), 'validate', 'example'],
+                                        env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(path.read_text(), text)
+                self.assertIn('Legacy' if text.startswith('example') else 'Home fallback: 1/1', result.stdout)
+
+    def test_autostart_wrapper_propagates_exit_and_warn_only_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            cli = directory/'desktop_preset'
+            notify = directory/'omarchy'
+            marker = directory/'notified'
+            notify.write_text('#!/bin/sh\ntouch "'+str(marker)+'"\n')
+            notify.chmod(0o755)
+            env = dict(os.environ, PATH=f'{directory}:{os.environ["PATH"]}')
+            for rc in (0, 1):
+                cli.write_text('#!/bin/sh\necho "warning: synthetic Home fallback"\nexit '+str(rc)+'\n')
+                cli.chmod(0o755)
+                result = subprocess.run([str(ROOT/'bin/desktop-preset-autostart')], env=env,
+                                        stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, rc)
+                self.assertEqual(marker.exists(), rc != 0)
+
     def test_reinstall_and_uninstall_preserve_data_and_unrelated_customization(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

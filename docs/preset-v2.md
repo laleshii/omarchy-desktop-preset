@@ -12,23 +12,23 @@ independent locations and one floating terminal:
     {
       "id": "w1",
       "class": "org.gnome.Nautilus",
-      "title_hint": "Documents",
+      "title_hint": "Example one",
       "argv": ["nautilus", "--new-window"],
       "cwd": null,
       "floating": false,
       "rect": [6, 36, 1014, 1038],
-      "uri": "file:///example/Documents",
+      "uri": "file:///example/one",
       "location_source": "explicit"
     },
     {
       "id": "w2",
       "class": "org.gnome.Nautilus",
-      "title_hint": "Projects",
+      "title_hint": "Example two",
       "argv": ["nautilus", "--new-window"],
       "cwd": null,
       "floating": false,
       "rect": [1028, 36, 1526, 1038],
-      "uri": "file:///example/Projects",
+      "uri": "file:///example/two",
       "location_source": "explicit"
     },
     {
@@ -50,7 +50,7 @@ independent locations and one floating terminal:
 }
 ```
 
-The example paths must be replaced with accessible real locations before load.
+The example paths are synthetic; inaccessible locations will use Home on load.
 `workarea` and `rect` are `[x, y, width, height]` in logical pixels. Workarea
 excludes monitor reservations, while each rectangle is the rendered client
 rectangle reported by Hyprland. `floating` is explicit, not inferred from class.
@@ -70,14 +70,21 @@ null means capture could not determine a command. `cwd` is an absolute path or
 null. A cold load requires usable argv for every non-Nautilus instance.
 
 For Nautilus, `uri` supplies the launch location and `argv` is replaced with
-`["nautilus", "--new-window", uri]`. `uri: null` means unavailable, not home.
-`location_source` is explanatory: `explicit`, `correlated-dbus`, or `unavailable`.
+`["nautilus", "--new-window", uri]`. `uri: null` means no folder was recorded;
+load opens a separate window in the current user's Home without changing the
+file. Invalid/unavailable locations use the same nonfatal fallback.
+`location_source` is explanatory: `explicit`, `singleton-dbus`, `correlated-dbus`,
+or `unavailable`. Optional `location_confidence` is `user-confirmed`, `proven`, or
+`unknown`. Old v2 files need neither field and are not automatically migrated.
 Unknown/unavailable data is never inferred from another window of the same class.
 The `location set` helper changes one URI while preserving IDs, geometry, launch
 metadata and unrelated autostart assignments.
 
 The session journal is stored separately under the user's private runtime
 directory. It contains temporary addresses, process-lifetime fingerprints,
-allocation/pending records and optional D-Bus window correlations. It is not
-part of the saved format, is not portable to another compositor session, and
+allocation/pending records, explicit live-window overrides, effective Home
+fallbacks and optional D-Bus window correlations. Fingerprints include the
+compositor stable ID when available, preventing same-process address reuse.
+The journal is not part of the saved format, is not portable to another compositor
+session, and
 should not be published with presets.
