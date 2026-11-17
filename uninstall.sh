@@ -33,7 +33,7 @@ USAGE
 done
 
 info "removing scripts from $BIN_DIR"
-for f in desktop_preset desktop-preset-layout desktop-preset-autostart \
+for f in desktop_preset desktop-preset-layout desktop-preset-v2 desktop-preset-autostart \
          desktop-preset-menu-load desktop-preset-menu-save desktop-preset-menu-clear \
          desktop-preset-menu-autostart-enable desktop-preset-menu-autostart-disable desktop-preset-menu-autostart-list; do
   if [[ -e "$BIN_DIR/$f" ]]; then
@@ -47,10 +47,7 @@ if [[ -f $MENU_FILE ]]; then
   tmp=$(mktemp)
   removed=0
   while IFS= read -r line; do
-    if [[ $line =~ \"(trigger\.preset[A-Za-z0-9_.]*)\" ]] \
-       || [[ $line == *"Desktop Preset:"* ]] \
-       || [[ $line == *"omarchy-menu-select"* ]] \
-       || [[ $line == *"notification, since these run with no terminal"* ]]; then
+    if [[ $line =~ ^[[:space:]]*\"trigger\.preset(\.[A-Za-z0-9_.]+)?\"[[:space:]]*: ]]; then
       removed=1
       continue
     fi
@@ -69,9 +66,10 @@ else
 fi
 
 info "removing login autostart wiring"
-if [[ -f $AUTOSTART_FILE ]] && grep -q 'desktop-preset-autostart' "$AUTOSTART_FILE" 2>/dev/null; then
+HOOK_RE='^[[:space:]]*o\.launch_on_start\("desktop-preset-autostart"\)[[:space:]]*(--.*)?$'
+if [[ -f $AUTOSTART_FILE ]] && grep -qE "$HOOK_RE" "$AUTOSTART_FILE" 2>/dev/null; then
   tmp=$(mktemp)
-  grep -v 'desktop-preset-autostart' "$AUTOSTART_FILE" > "$tmp"
+  grep -vE "$HOOK_RE" "$AUTOSTART_FILE" > "$tmp"
   mv "$tmp" "$AUTOSTART_FILE"
   info "removed from $AUTOSTART_FILE"
 else

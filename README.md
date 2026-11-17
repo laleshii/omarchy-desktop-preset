@@ -1,215 +1,248 @@
 # desktop_preset
 
-Save the exact arrangement of windows on a Hyprland workspace — which apps,
-where, and how the screen is split between them — and restore it later with
-one command or from the Omarchy menu.
+Save a manually chosen startup workspace arrangement and restore its individual
+windows at login, or with `desktop_preset load`. Built for Omarchy and Hyprland
+Dwindle. No permanent window rules, class routing, daemon, or automatic resaving.
+Later application launches behave normally on any workspace.
 
+```sh
+desktop_preset save work
+desktop_preset load work -w 3
+desktop_preset autostart set work -w 3
 ```
-$ desktop_preset save chat
-$ desktop_preset load chat
-```
 
-Built for [Omarchy](https://omarchy.org/). Not a Quickshell "shell plugin"
-(the ones you install with `omarchy plugin clone`) — it's a couple of CLI
-scripts plus one entry added to your Omarchy menu.
+New snapshots use **version 2**: separate IDs for every window, including identical
+classes and titles; a split tree with a ratio at each node; per-window floating
+geometry; argv arrays and optional Nautilus locations. Existing text presets
+still load through the legacy reader, including the cross-workspace fix in
+[PR #1](https://github.com/laleshii/omarchy-desktop-preset/pull/1).
 
-## Demo
+**Nautilus automatic capture is partial.** Arbitrary already-open Wayland windows
+cannot currently be correlated reliably with Nautilus's GTK D-Bus window IDs.
+Use explicit per-window locations when saving those windows. Missing locations
+are saved as `null`, warned about (including from the Save menu), and refused on
+cold load. The tool never guesses a folder from a title, process cwd, or argv.
+See [Nautilus locations](#nautilus-locations).
 
-![Restored layout](docs/screenshots/4-restored.jpg)
+## Install and update
 
-Three terminals, back exactly as arranged — same split shape, same
-sides — after `desktop_preset clear` wiped the workspace and
-`desktop_preset load demo` rebuilt it.
+Requirements: Omarchy 4+, Hyprland 0.56+ with Lua dispatches, Bash, jq, Python 3.
+Optional **PyGObject** (`python-gobject` on Arch) enables typed Nautilus D-Bus
+correlation and displayed-location verification. No Python packages are installed
+by this project. Tested on Omarchy 4.5.0-3, Hyprland 0.56.2 and Nautilus 51.1.
 
-### From the menu
+Run the installer **from your chosen checkout**:
 
-No terminal needed — everything below runs from **Menu → Trigger → Preset**.
-
-| | |
-|---|---|
-| ![Trigger menu](docs/screenshots/5-menu-trigger.jpg) `omarchy menu` → Trigger, with Preset listed | ![Preset submenu](docs/screenshots/6-menu-preset.jpg) The Preset submenu: Load / Save / Clear desktop / Autostart |
-| ![Load picker](docs/screenshots/7-menu-load-picker.jpg) Load — picks from your saved presets | ![Save prompt](docs/screenshots/8-menu-save-input.jpg) Save — names the current workspace's layout |
-| ![Autostart submenu](docs/screenshots/9-menu-autostart.jpg) Autostart — Enable here / Disable here / List autostart | ![Autostart enable picker](docs/screenshots/10-menu-autostart-enable-picker.jpg) Enable here — picks which preset this workspace auto-loads at login |
-
-## Why
-
-Omarchy's `dwindle` layout (the default tiling layout) has no built-in way
-to save an arrangement of windows and get it back later. `desktop_preset`
-reconstructs the actual split tree from each window's saved position and
-size, and replays it with Hyprland's `preselect` primitive — the same
-mechanism Hyprland itself uses to control which side a new window lands on.
-
-That works for any shape dwindle can produce, not just the two-app or
-three-app case — a single window, a one-window-plus-a-stack layout, a
-plain 2×2 grid, or any other split — reproducing the *exact* shape, not
-just "these apps, roughly arranged." The one real cap is 10 windows; see
-[Limitations](#limitations).
-
-## Install
-
-```
-git clone <this-repo> && cd omarchy-desktop-preset
+```sh
+cd /path/to/your/omarchy-desktop-preset
 ./install.sh
 ```
 
-This copies the scripts to `~/.local/bin`, creates `~/.config/desktop_preset`,
-adds a **Preset** entry under **Trigger** in your Omarchy menu, and wires up
-login autostart via `~/.config/hypr/autostart.lua` (safe to re-run — it won't
-duplicate the menu entry or the autostart line if they're already there).
+It copies `bin/*` scripts to `~/.local/bin`, adds **Trigger → Preset** in the
+Omarchy menu, and adds one `o.launch_on_start("desktop-preset-autostart")` hook to
+`~/.config/hypr/autostart.lua`. Reinstallation overwrites only project scripts;
+it preserves presets, autostart assignments and unrelated menu/config entries.
+An overwrite install avoids an unnecessary uninstall/reinstall gap.
 
-To remove it:
+Develop and update in the same fork checkout. Check the current branch and its
+tracking remote before pulling; keep your patched feature branch selected until
+it has been merged:
 
-```
-./uninstall.sh           # removes scripts, menu entries, and autostart wiring
-./uninstall.sh --purge   # also deletes ~/.config/desktop_preset (your presets)
-```
-
-Your saved presets are left in place by default so a reinstall doesn't lose
-them.
-
-### Dependencies
-
-- **Omarchy 4.0+** on **Hyprland 0.56+**. Built and tested against Omarchy
-  `4.0.0-1` / Hyprland `0.56.2`. The dispatches this relies on
-  (`hl.dsp.window.move`, `hl.dsp.layout("preselect …")`) use Hyprland's Lua
-  dispatch syntax — older Hyprland/Omarchy builds that only understood the
-  legacy string-form dispatches (`movetoworkspacesilent 9,address:0x..`)
-  will error out. If `desktop_preset load` fails immediately with a dispatch
-  syntax error, that's almost certainly why — please open an issue with your
-  `omarchy version` and `hyprctl version` output.
-- `jq`, `python3` (for the split-tree inference — see below)
-- The `omarchy` CLI (ships with Omarchy)
-
-## Usage
-
-```
-desktop_preset list                     # show saved presets and their apps
-desktop_preset save <name>              # save the current workspace
-desktop_preset save <name> --force      # overwrite an existing preset
-desktop_preset load <name>              # load onto the current workspace
-desktop_preset load <name> -w 3         # load onto workspace 3
-desktop_preset load <name> --clear      # close what's there first (asks)
-desktop_preset clear                    # just close everything here
-desktop_preset show <name>              # print the raw preset file
-desktop_preset edit <name>              # open it in $EDITOR
+```sh
+git status --short --branch
+git remote -v
+git pull --ff-only origin <your-patched-branch>
+./install.sh
 ```
 
-Add `-n`/`--dry-run` to any `load`/`clear` to see what would happen without
-doing it. Run `desktop_preset --help` for the full flag list.
+Do not switch to an unpatched upstream branch to perform a local update. See
+[local deployment and rollback](docs/local-deployment.md).
 
-From the desktop: open the Omarchy menu → **Trigger → Preset → Load / Save /
-Clear desktop**. Each pops its own picker (no terminal needed) and reports
-the result as a notification.
+## Commands and menus
 
-`load` reuses matching windows **on the target workspace**. If none exists
-there, it launches the recorded command and waits for a matching **new window
-address** (up to 20 seconds; override with `DESKTOP_PRESET_TIMEOUT`). It leaves
-existing windows on other workspaces in place. This also applies to manual
-loads: move a window to the target workspace yourself if you want it reused.
-Presets on different workspaces can therefore restore separate windows of
-the same application.
-
-The launch command must open a separate window when the app is already
-running. For GNOME Files, `load` adds `--new-window` to the exact argument-free
-commands `nautilus` and `/usr/bin/nautilus`, optionally prefixed by
-`uwsm-app -- `. Commands with arguments, other wrappers, or shell syntax are
-run unchanged: edit those presets to request a new window explicitly, e.g.
-`uwsm-app -- nautilus --new-window "file:///path/to/folder"` (see
-[nautilus(1)](https://man.archlinux.org/man/nautilus.1.en)). Other apps need
-their own supported new-window command; no generic flag is added. If no new
-matching window appears, `load` reports a timeout and leaves the existing
-windows in place. Normal application launches outside `load` are unaffected.
-
-## Auto-load at login
-
-Pin a preset to a workspace and it loads automatically the next time you log
-in — handy for a "chat" or "work" arrangement you always want in the same
-place, without running anything by hand.
-
-```
-desktop_preset autostart set chat -w 3   # workspace 3 loads 'chat' at login
-desktop_preset autostart list            # see what's configured
-desktop_preset autostart unset -w 3      # stop auto-loading on workspace 3
+```sh
+desktop_preset list [--names]
+desktop_preset show work
+desktop_preset edit work                   # $EDITOR, default nano
+desktop_preset inspect [-w 3]              # live addresses and verified known URIs
+desktop_preset save work [-w 3]
+desktop_preset save work --force           # backup, then explicit recapture
+desktop_preset load work [-w 3]
+desktop_preset load work --dry-run
+desktop_preset clear [-w 3]                # asks before closing windows
+desktop_preset load work --clear          # asks before closing target windows
 ```
 
-Or from the desktop: **Menu → Trigger → Preset → Autostart → Enable here /
-Disable here** (uses whichever workspace you're on) and **List autostart**.
+Preset names use letters, digits, `_` and `-`. Files stay in
+`${XDG_CONFIG_HOME:-$HOME/.config}/desktop_preset/<name>.preset` (or
+`DESKTOP_PRESET_DIR`). The menu keeps Load, Save, Clear and Autostart actions.
+V2 leaves the invoking terminal open; use the menu or a different workspace if
+that terminal should not be part of the saved arrangement.
 
-`./install.sh` wires the login side up for you, adding
-`o.launch_on_start("desktop-preset-autostart")` to
-`~/.config/hypr/autostart.lua` (safe to re-run, same as the menu entry). At
-login this runs `desktop_preset autostart run`, which loads every configured
-workspace — skipping any workspace that already has windows on it rather
-than closing them, so it won't clobber anything if you trigger it by hand
-mid-session. The mapping itself lives in
-`~/.config/desktop_preset/autostart.conf` (`<workspace>=<preset>`, one per
-line).
+`--dry-run` launches, closes and moves no windows, and writes no preset or
+allocation journal. It describes the intended operations; it does not prove the
+apps can launch or the geometry can be realized.
 
-## How a preset is stored
+## Nautilus locations
 
-Presets live in `~/.config/desktop_preset/<name>.preset` — plain text, safe
-to hand-edit:
+First inspect the workspace's individual addresses, then supply the actual
+active folder for each window explicitly:
 
-```
-org.telegram.desktop         | uwsm-app -- Telegram
-web.whatsapp.com             | omarchy-launch-webapp https://web.whatsapp.com/
-spotify_player                | omarchy-launch-tui spotify_player
-
-@anchor org.telegram.desktop
-@split org.telegram.desktop r spotify_player
-@split org.telegram.desktop d web.whatsapp.com
+```sh
+desktop_preset inspect -w 3
+desktop_preset save files -w 3 \
+  --location 0x123 '/absolute/path/with spaces' \
+  --location 0x456 'file:///absolute/path/Unicode%20folder' \
+  --location 0x789 '/another/folder'
 ```
 
-- `<pattern> | <command>` — one per app. `pattern` is matched against each
-  window's class or title (same rule Omarchy's own launcher uses); `command`
-  is how to launch it if it isn't already open.
-- `@anchor <pattern>` — the window placed first, alone.
-- `@split <focus> <dir> <new>` — split `<focus>`'s slot (`r`ight or `d`own),
-  placing `<new>` there. One line per window after the anchor, in build
-  order. This is the literal split tree, written by `save` — see
-  `bin/desktop-preset-layout` for the reconstruction algorithm.
-- `@size <pattern> <w> <h>` — `<pattern>`'s exact saved size right after the
-  split above it. `load` resizes it back along that split's axis only (width
-  for a left/right split, height for up/down), and Hyprland grows or shrinks
-  the new sibling to fill what's left — this is what turns dwindle's default
-  50/50 into the saved ratio, not just the saved shape.
-- `@float <pattern> <x> <y> <w> <h>` — exact position/size for a floating
-  window.
-- `@close-terminal` — if present, `load` closes the terminal it was run
-  from once loading finishes (handy when triggering a preset from a
-  terminal you don't want left open).
+The addresses above are examples: use current addresses from `inspect`. Each
+saved row has an independent `w1`, `w2`, … ID, even for the same directory twice.
+Addresses are never stored as reboot-persistent identities in the preset.
+Alternatively, set a location **by saved ID** after inspecting `show`:
 
-`save` falls back to plain reading order (no `@anchor`/`@split`) when two
-windows on the workspace share the same pattern — their identity is
-ambiguous, so there's nothing reliable to build a tree from — or with more
-than 10 windows.
+```sh
+desktop_preset location set files w1 '/absolute/path/with spaces'
+desktop_preset location set files w3 'sftp://server.example/share/folder'
+```
 
-For an app that isn't a Chrome webapp or an Omarchy TUI wrapper, `save`
-tries two ways to guess its launch command, in order:
+This helper backs up the preset, updates only that instance's location, and
+preserves the tree and IDs. Paths are normalized to URIs; URIs and argv are JSON
+data, passed directly to `subprocess.Popen`, without shell interpolation. Quote
+arguments in your shell. Whitespace, Unicode, percent encoding and punctuation
+are supported. Each launch uses `nautilus --new-window URI`, including repeated
+identical URIs. Home is represented by an explicit home URI, never by `null`.
 
-1. The window's actual process, via `/proc/<pid>/cmdline` — the exact argv
-   it was launched with (flags, files, profiles included), plus its working
-   directory if that differs from `$HOME`. More accurate than any static
-   file when it's usable, since it reflects how *this* window was actually
-   started rather than a generic default.
-2. Its `.desktop` file (matched by filename, then by `StartupWMClass`), the
-   same source a real launcher would use.
+With PyGObject and `OpenWindowsWithLocations`, a sequential launch correlates
+**one new Hyprland address** with **one new Nautilus GTK object**. It waits for
+that object's displayed URI to match the requested URI before assigning the
+window to its slot. This correlation is session-local and invalidated by a D-Bus
+owner or process change. Subsequent saves of these tracked **single-tab** windows
+can capture their current URI automatically. Closing the tool does not require
+a watcher; a private runtime journal records the correlation.
 
-If neither works, the command is left as `TODO(<class>)`, and `load` refuses
-to run it — fill it in by hand (`desktop_preset edit <name>`)
-before loading that preset cold.
+This does **not** provide automatic capture of arbitrary pre-existing windows.
+The installed [Nautilus API](https://github.com/GNOME/nautilus/blob/51.1/src/nautilus-application.c)
+exports GTK object paths and tab locations, without a Hyprland address. GTK4
+AT-SPI on the tested Wayland host reports window origins `(0,0)`; equal sizes or
+titles do not establish identity. The tool deliberately avoids such guesses.
+Multi-tab windows require an explicit active-location override: the API's tab
+list does not establish the active URI. Tab history and inactive tabs are not
+restored.
 
-## Limitations
+Local folders must exist and be accessible before loading; missing disks or
+folders cause a visible failure, without a home-directory fallback. Remote/GVfs
+URIs may be specified explicitly and are passed unchanged as data. Credentials,
+mounts and network access must already work; a slow/inaccessible location times
+out instead of being marked restored. Remote capture/restore has **not** been
+live validated. Without PyGObject, launches can pass a supplied URI but report
+that the displayed location is unverified. With a working D-Bus API, missing or
+mismatched location verification fails the load.
 
-- **`dwindle` layout only.** Hyprland's `master` layout and the
-  `scrolling` toggle build their arrangement differently; this hasn't been
-  tested against either.
-- **Ambiguous window identity.** Two windows with the same generic class and
-  no distinguishing title (e.g. two plain terminals) can't be told apart —
-  `save` detects this and falls back to plain ordering rather than guessing.
-- Single-workspace, single-monitor arrangements. Multi-monitor workspace
-  layouts aren't something this has been exercised against.
+## Identity, reuse and failure recovery
 
-## License
+A v2 load maps `instance ID → exact live address` once. An address is consumed
+once, and only workspace-local existing windows can be reused. Cold launches
+snapshot all addresses and await a new exact-class window, excluding old windows
+even if their titles change. The private journal is scoped to the compositor
+session, preset contents and workspace and validates the process lifetime.
+Concurrent v2 loads are serialized by a session lock.
 
-MIT — see [LICENSE](LICENSE).
+A second manual load reuses valid journal assignments and restores their
+geometry without launching duplicates. Without a journal, reuse must be
+unambiguous in both directions. Indistinguishable occupied windows or unrelated
+extra windows cause a preflight failure before launches or moves. Use an empty
+workspace, or explicitly save the intended existing workspace to bind its
+instances. The tool does not pull matching windows from another workspace.
+Avoid creating unrelated windows in the target workspace while loading.
+
+A timeout retains a pending-launch record. An automatic retry could otherwise
+create a second window after a slow first launch. Inspect late windows, then
+explicitly retry if appropriate:
+
+```sh
+desktop_preset load work --retry-pending
+```
+
+A window that closes or moves during replay causes failure; other workspaces'
+windows are left alone. Selected staged windows are returned to the target on
+failure. A failed replay can have changed the target layout; it is not an atomic
+compositor transaction. The private runtime files are not presets and disappear
+with the runtime session; no window addresses are reused across reboots.
+
+## Dwindle geometry and limits
+
+All tiled windows (up to 10) participate in tree inference by **instance ID**.
+There is no duplicate-class fallback. Leaves record rendered rectangles and
+internal nodes record axis, ordered children and a normalized first-child ratio.
+Cuts are inferred at gap/border midpoints relative to the monitor workarea.
+The loader stages the selected tiled windows, replays focus/preselect/insert,
+and sets each new parent's ratio with `splitratio <value> exact` **before**
+subdividing its children. Floating windows retain their own state and rectangles.
+No global options or application constraints are changed.
+
+The workspace must use Dwindle with `use_active_for_splits` enabled and either
+`preserve_split` or `smart_split` enabled. Unsupported policy is reported instead
+of changed. Fullscreen/grouped snapshots, Master, Scrolling and multi-monitor
+workspace layouts are outside the supported scope.
+
+On the same monitor, workarea and settings, verification requires every rendered
+window position and size to differ by **at most 8 logical pixels**. The live
+six-window nested test measured **3 px maximum**. Changed resolutions use the
+saved normalized cuts; floating rectangles scale and stay inside the workarea.
+Changed gaps, scale, borders or app min/max sizes can prevent the 8 px criterion;
+the loader reports a geometry failure rather than claiming exact restoration.
+It does not relax application constraints (including AmneziaVPN constraints).
+
+Rectangles cannot reveal a unique hidden compositor tree for geometrically
+equivalent arrangements, such as a perfectly aligned 2×2 grid. In that case the
+tool reconstructs a deterministic compatible guillotine tree with the same
+rendered ordering and proportions. It does not claim to read Hyprland's private
+tree. Other apps' launch argv/cwd are best-effort process or desktop-entry data;
+a shared application process may not identify per-window launch arguments.
+Terminal shell sessions, jobs, command history, open files, and browser tabs are
+not restored. Review unusual application argv before relying on a cold login.
+
+## Legacy files and explicit migration
+
+Legacy pattern/command rows and `@anchor`, `@split`, `@size`, `@float`,
+`@close-terminal` remain readable. Their shell launch commands remain trusted
+executable configuration; only load legacy files you trust. V2 argv never uses
+a shell. The previous workspace-local reuse/new-address fix remains intact.
+
+Old duplicate-pattern files cannot recover window identities, folders or split
+ratios that were never recorded. They produce an ambiguity warning; their legacy
+behavior is retained, without an invented tree. Load/edit is never an implicit
+migration. Arrange the actual windows, specify any missing Nautilus locations,
+then explicitly `save NAME --force`. A timestamped `.preset.bak.*` retains the
+old file. Preset names, menu selection and `autostart.conf` assignments stay the
+same. Autostart only reads presets and skips occupied workspaces.
+
+## Login autostart
+
+```sh
+desktop_preset autostart set work -w 3
+desktop_preset autostart list
+desktop_preset autostart unset -w 3
+```
+
+`autostart.conf` remains `<workspace>=<preset>`, one mapping per line. The single
+login hook loads configured empty workspaces once. It neither overwrites presets
+nor changes ordinary later launch behavior. Running it again skips occupied
+workspaces. A failure is propagated even if later workspaces load successfully.
+
+## Validation and removal
+
+```sh
+python3 -m unittest discover -s tests -v
+for script in install.sh uninstall.sh bin/*; do
+  if head -n1 "$script" | grep -q bash; then bash -n "$script"; fi
+done
+git diff --check
+./uninstall.sh                 # keep presets and autostart assignments
+```
+
+Tests use stateful fake apps/compositors and a disposable HOME; see
+[validation evidence](docs/validation-v2.md) for the separate live-host results.
+ShellCheck was unavailable on the validation host. Design decisions are in
+[design-v2.md](docs/design-v2.md). MIT license: [LICENSE](LICENSE).

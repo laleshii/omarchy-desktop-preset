@@ -10,9 +10,16 @@
 
 set -uo pipefail
 
+# Keep the legacy reader intact; new snapshots use a typed instance schema.
+V2="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/desktop-preset-v2"
+case ${1:-} in
+  save|location|inspect) exec python3 "$V2" "$@" ;;
+esac
+
 DIR="${DESKTOP_PRESET_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/desktop_preset}"
 LAUNCH_TIMEOUT="${DESKTOP_PRESET_TIMEOUT:-20}"
 DRY=0; CLEAR=0; ASSUME_YES=0; WS=""; CLOSE_TERM=-1; FORCE=0; NAMES_ONLY=0; RAW=0   # -1 = follow preset directive
+RETRY_PENDING=0
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
@@ -35,6 +42,8 @@ usage:
   desktop_preset save <name> [-f]         draft a preset from this workspace
   desktop_preset clear [options]          close windows on a workspace
   desktop_preset edit <name>              open a preset in $EDITOR
+  desktop_preset inspect [-w N]          show instance addresses and known URIs
+  desktop_preset location set NAME ID URI  set a v2 Nautilus instance location
   desktop_preset autostart list [--raw]   show which workspace loads what at login
   desktop_preset autostart set <name> -w N    auto-load <name> on workspace N at login
   desktop_preset autostart unset -w N     stop auto-loading on workspace N
@@ -52,6 +61,10 @@ load-only options:
 
 save-only options:
   -f, --force               overwrite an existing preset of the same name
+      --location ADDRESS URI  explicitly capture this Nautilus window's URI
+
+v2 load recovery:
+      --retry-pending       explicitly retry a timed-out launch after inspection
 
 autostart:
   a mapping of workspace -> preset name, stored at
@@ -78,12 +91,11 @@ presets live in ~/.config/desktop_preset/<name>.preset
   @float <pattern> <x> <y> <w> <h>       exact position/size for a floating
                                           window (written by save)
 
-save reconstructs the actual dwindle split tree from each window's saved
-position and size and records it exactly as @anchor/@split/@size — this is
-what loading replays, so both the split shape and ratio come back exact, not
-guessed. Falls back to plain reading order (no @anchor) when two windows
-share the same pattern (their identity is ambiguous) or with more than 10
-windows.
+New saves use version 2 JSON: distinct instance IDs, argv arrays, per-node
+split ratios and per-window locations. Legacy text files remain readable.
+save --force backs up and recaptures the current workspace; it does not
+recover locations or geometry absent from an old file. Untracked Nautilus
+locations require explicit overrides. See README.md for capture limitations.
 USAGE
 }
 
@@ -352,6 +364,11 @@ cmd_list() {
     found=1; n=$(basename "$f" .preset)
     if (( NAMES_ONLY )); then printf '%s\n' "$n"; continue; fi
     printf '\033[1m%s\033[0m\n' "$n"
+    if [[ $(head -c1 "$f") == '{' ]]; then
+      jq -r '.windows[] | "    \(.id)  \(.class)  location=\(.location_source // "n/a")"' "$f"
+      printf '\n'
+      continue
+    fi
     while IFS= read -r line; do
       [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
       if [[ $line =~ ^[[:space:]]*@ ]]; then
@@ -522,6 +539,22 @@ cmd_load() {
   f=$(preset_file "$name"); [[ -r $f ]] || die "no such preset: $name"
   ws=${WS:-$(cur_ws)}
   [[ $ws =~ ^[0-9]+$ ]] || die "workspace must be a number: $ws"
+
+  if [[ $(head -c1 "$f") == '{' ]]; then
+    local -a args=(load "$name" -w "$ws")
+    (( DRY )) && args+=(--dry-run)
+    (( CLEAR )) && args+=(--clear)
+    (( ASSUME_YES )) && args+=(--yes)
+    (( RETRY_PENDING )) && args+=(--retry-pending)
+    (( CLOSE_TERM == 1 )) && warn "v2 leaves the calling terminal open; use the menu for an unobstructed target workspace"
+    python3 "$V2" "${args[@]}"
+    return $?
+  fi
+  if awk -F '|' '!/^[[:space:]]*(#|@|$)/ {gsub(/[[:space:]]+$/, "", $1); if (seen[$1]++) exit 1}' "$f"; then
+    :
+  else
+    warn "legacy duplicate patterns cannot identify individual windows or recover missing geometry/locations; explicitly recapture with save --force"
+  fi
 
   grep -qE '^[[:space:]]*@close-terminal[[:space:]]*$' "$f" && want_close=1
   (( CLOSE_TERM == 1 )) && want_close=1
@@ -738,6 +771,7 @@ while (( $# )); do
     -f|--force)           FORCE=1; shift ;;
     --names)              NAMES_ONLY=1; shift ;;
     --raw)                RAW=1; shift ;;
+    --retry-pending)      RETRY_PENDING=1; shift ;;
     -n|--dry-run)         DRY=1; shift ;;
     -h|--help)            usage; exit 0 ;;
     --)                   shift; while (( $# )); do POS+=("$1"); shift; done ;;
@@ -746,6 +780,15 @@ while (( $# )); do
   esac
 done
 set -- "${POS[@]+"${POS[@]}"}"
+
+case $sub in
+  show|edit|load)
+    [[ ${1:-} =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid preset name" ;;
+  autostart)
+    if [[ ${1:-} == set ]]; then
+      [[ ${2:-} =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid preset name"
+    fi ;;
+esac
 
 mkdir -p "$DIR"
 case $sub in

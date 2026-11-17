@@ -91,6 +91,63 @@ def emit(tree):
     return steps
 
 
+def infer_v2(rects, workarea):
+    """Infer ID-based cuts and cell ratios, including gap/border midpoints.
+
+    Rectangles cannot reveal which of several geometrically equivalent trees
+    the compositor used. Keep a deterministic compatible tree in that case.
+    """
+    if not rects:
+        return None
+    if len(rects) > 10 or len({r['id'] for r in rects}) != len(rects):
+        raise ValueError('tree inference requires 1–10 distinct instance IDs')
+    items = [(r['id'], r['x'], r['y'], r['x'] + r['w'], r['y'] + r['h'])
+             for r in rects]
+    tree = build(items)
+    by_id = {r[0]: r for r in items}
+
+    def leaves(node):
+        return ([by_id[node[1]]] if node[0] == 'leaf'
+                else leaves(node[2]) + leaves(node[3]))
+
+    def encode(node, box):
+        if node[0] == 'leaf':
+            return {'id': node[1]}
+        _, axis, left, right = node
+        edge = axis + 3
+        start = axis + 1
+        cut = (max(r[edge] for r in leaves(left)) +
+               min(r[start] for r in leaves(right))) / 2
+        ratio = (cut - box[axis]) / box[axis + 2]
+        if not 0.05 <= ratio <= 0.95:
+            raise ValueError('split ratio exceeds Dwindle constraints')
+        a, b = list(box), list(box)
+        a[axis + 2] = cut - box[axis]
+        b[axis] = cut
+        b[axis + 2] = box[axis + 2] - a[axis + 2]
+        return {'axis': 'x' if axis == 0 else 'y', 'ratio': ratio,
+                'first': encode(left, a), 'second': encode(right, b)}
+
+    return encode(tree, workarea)
+
+
+def steps_v2(tree):
+    """Each ratio is set while its children are still leaves."""
+    def first(node):
+        return node['id'] if 'id' in node else first(node['first'])
+
+    def walk(node):
+        if 'id' in node:
+            return
+        yield {'focus': first(node['first']), 'new': first(node['second']),
+               'dir': 'r' if node['axis'] == 'x' else 'd',
+               'ratio': node['ratio']}
+        yield from walk(node['first'])
+        yield from walk(node['second'])
+
+    return (first(tree), list(walk(tree))) if tree else (None, [])
+
+
 def cmd_infer():
     rects = json.load(sys.stdin)
     if not rects:
